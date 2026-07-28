@@ -19,7 +19,8 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Mamba transfer kernel tests require CUDA."
+    not torch.cuda.is_available(),
+    reason="Mamba transfer kernel tests require a GPU exposed through torch.cuda.",
 )
 
 DEVICE = "cuda"
