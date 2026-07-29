@@ -46,9 +46,19 @@ if is_cuda() or is_musa():
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
 elif is_hip():
+    from aiter.ops.sampling import (
+        top_k_renorm_probs as _aiter_top_k_renorm_probs,
+    )
     from sglang.kernels.ops.sampling.top_p_renorm_triton import (
         top_p_renorm_probs_triton as top_p_renorm_prob,
     )
+
+    def top_k_renorm_prob(
+        probs: torch.Tensor, top_k: torch.Tensor | int
+    ) -> torch.Tensor:
+        if isinstance(top_k, torch.Tensor):
+            return _aiter_top_k_renorm_probs(probs, top_k, 0)
+        return _aiter_top_k_renorm_probs(probs, None, int(top_k))
 
     _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
@@ -787,9 +797,13 @@ def build_dflash_verify_target_probs(
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
+            repeated_top_ks = torch.repeat_interleave(
+                sampling_info.top_ks, draft_token_num, dim=0
+            )
+            repeated_top_ks.clamp_(min=1, max=target_probs.shape[-1])
             target_probs = top_k_renorm_prob(
                 target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+                repeated_top_ks,
             )
         if need_top_p:
             target_probs = top_p_renorm_prob(
