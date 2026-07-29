@@ -28,7 +28,7 @@ class TestDsparkMixedTopKAMD(CustomTestCase):
         sampling_info = SimpleNamespace(
             need_top_k_sampling=True,
             need_top_p_sampling=False,
-            temperatures=torch.ones(batch_size, device="cuda"),
+            temperatures=torch.ones((batch_size, 1), device="cuda"),
             top_ks=torch.tensor(
                 [TOP_K_ALL, 8], device="cuda", dtype=torch.int32
             ),
