@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention import aiter_backend
+from sglang.srt.models.kimi_k3 import (
+    _get_kimi_k3_no_positional_rotary_embedding,
+)
 
 
 @pytest.mark.parametrize("num_heads", [3, 5, 12, 15])
@@ -65,3 +68,32 @@ def test_aiter_mla_preserves_existing_repeat_padding(num_heads, repeat_factor):
         )
 
     torch.testing.assert_close(actual, q[:, :, : layer.v_head_dim])
+
+
+def test_kimi_k3_aiter_identity_rope_cache_is_exact_and_shared():
+    rope = _get_kimi_k3_no_positional_rotary_embedding(
+        rotary_dim=64,
+        max_position_embeddings=32,
+        dtype=torch.bfloat16,
+        is_neox_style=True,
+    )
+    same_rope = _get_kimi_k3_no_positional_rotary_embedding(
+        rotary_dim=64,
+        max_position_embeddings=32,
+        dtype=torch.bfloat16,
+        is_neox_style=True,
+    )
+
+    assert rope is same_rope
+    assert rope.cos_cache.shape == (32, 1, 1, 32)
+    assert rope.sin_cache.shape == (32, 1, 1, 32)
+    assert rope.cos_cache.dtype == torch.bfloat16
+    assert rope.sin_cache.dtype == torch.bfloat16
+    assert torch.all(rope.cos_cache == 1)
+    assert torch.all(rope.sin_cache == 0)
+
+    query = torch.randn(4, 12, 64, dtype=torch.bfloat16)
+    key = torch.randn(4, 1, 64, dtype=torch.bfloat16)
+    actual_query, actual_key = rope(torch.arange(4), query, key)
+    assert actual_query is query
+    assert actual_key is key

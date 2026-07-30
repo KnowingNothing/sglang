@@ -8,7 +8,7 @@
 
 import logging
 from collections.abc import Iterable
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -127,6 +127,74 @@ _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+class _KimiK3NoPositionalRotaryEmbedding(nn.Module):
+    """Identity RoPE with explicit caches for fused AITER MLA.
+
+    Kimi K3 names the final Q/K slice ``qk_rope_head_dim`` for MLA layout
+    compatibility, but intentionally applies no positional rotation.  The
+    ordinary SGLang path represents that contract with ``skip_rope=True``.
+    AITER's fused Q/K concat-and-cache kernel still requires valid cos/sin
+    buffers, so provide the exact identity transform (cos=1, sin=0) used by
+    the reference implementation.
+    """
+
+    def __init__(
+        self,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        dtype: torch.dtype,
+        is_neox_style: bool,
+    ) -> None:
+        super().__init__()
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.is_neox_style = is_neox_style
+        cache_shape = (
+            max_position_embeddings,
+            1,
+            1,
+            rotary_dim // 2,
+        )
+        self.register_buffer(
+            "cos_cache",
+            torch.ones(cache_shape, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cache",
+            torch.zeros(cache_shape, dtype=dtype),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        *args,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del positions, args, kwargs
+        return query, key
+
+
+@lru_cache(maxsize=None)
+def _get_kimi_k3_no_positional_rotary_embedding(
+    rotary_dim: int,
+    max_position_embeddings: int,
+    dtype: torch.dtype,
+    is_neox_style: bool,
+) -> _KimiK3NoPositionalRotaryEmbedding:
+    # Match the shared-cache behavior of the regular RoPE factory instead of
+    # allocating the (potentially long-context) identity tables per layer.
+    return _KimiK3NoPositionalRotaryEmbedding(
+        rotary_dim=rotary_dim,
+        max_position_embeddings=max_position_embeddings,
+        dtype=dtype,
+        is_neox_style=is_neox_style,
+    )
 
 
 # MegaMoE SiTU sentinel: the patched deep_gemm mega kernel selects the K3 SiTU
@@ -1729,6 +1797,23 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        attention_backends = get_server_args().get_attention_backends()
+        if _is_hip and "aiter" in attention_backends:
+            rope_dtype = getattr(config, "dtype", torch.bfloat16)
+            if not isinstance(rope_dtype, torch.dtype):
+                rope_dtype = torch.bfloat16
+            max_position_embeddings = config.max_position_embeddings
+            if get_server_args().context_length is not None:
+                max_position_embeddings = min(
+                    max_position_embeddings,
+                    get_server_args().context_length,
+                )
+            self.rotary_emb = _get_kimi_k3_no_positional_rotary_embedding(
+                rotary_dim=config.qk_rope_head_dim,
+                max_position_embeddings=max_position_embeddings,
+                dtype=rope_dtype,
+                is_neox_style=not getattr(config, "rope_interleave", True),
+            )
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
