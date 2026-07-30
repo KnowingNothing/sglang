@@ -144,7 +144,6 @@ class _KimiK3NoPositionalRotaryEmbedding(nn.Module):
         self,
         rotary_dim: int,
         max_position_embeddings: int,
-        dtype: torch.dtype,
         is_neox_style: bool,
     ) -> None:
         super().__init__()
@@ -157,14 +156,16 @@ class _KimiK3NoPositionalRotaryEmbedding(nn.Module):
             1,
             rotary_dim // 2,
         )
+        # Match AITER's regular RoPE factory and ATOM's K3 identity RoPE:
+        # the fused MLA cache inputs are FP32 even when Q/K are BF16.
         self.register_buffer(
             "cos_cache",
-            torch.ones(cache_shape, dtype=dtype),
+            torch.ones(cache_shape, dtype=torch.float32),
             persistent=False,
         )
         self.register_buffer(
             "sin_cache",
-            torch.zeros(cache_shape, dtype=dtype),
+            torch.zeros(cache_shape, dtype=torch.float32),
             persistent=False,
         )
 
@@ -184,7 +185,6 @@ class _KimiK3NoPositionalRotaryEmbedding(nn.Module):
 def _get_kimi_k3_no_positional_rotary_embedding(
     rotary_dim: int,
     max_position_embeddings: int,
-    dtype: torch.dtype,
     is_neox_style: bool,
 ) -> _KimiK3NoPositionalRotaryEmbedding:
     # Match the shared-cache behavior of the regular RoPE factory instead of
@@ -192,7 +192,6 @@ def _get_kimi_k3_no_positional_rotary_embedding(
     return _KimiK3NoPositionalRotaryEmbedding(
         rotary_dim=rotary_dim,
         max_position_embeddings=max_position_embeddings,
-        dtype=dtype,
         is_neox_style=is_neox_style,
     )
 
@@ -1799,9 +1798,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         )
         attention_backends = get_server_args().get_attention_backends()
         if _is_hip and "aiter" in attention_backends:
-            rope_dtype = getattr(config, "dtype", torch.bfloat16)
-            if not isinstance(rope_dtype, torch.dtype):
-                rope_dtype = torch.bfloat16
             max_position_embeddings = config.max_position_embeddings
             if get_server_args().context_length is not None:
                 max_position_embeddings = min(
@@ -1811,7 +1807,6 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.rotary_emb = _get_kimi_k3_no_positional_rotary_embedding(
                 rotary_dim=config.qk_rope_head_dim,
                 max_position_embeddings=max_position_embeddings,
-                dtype=rope_dtype,
                 is_neox_style=not getattr(config, "rope_interleave", True),
             )
         # Installed before the output-gate wrap below so the gate multiply is

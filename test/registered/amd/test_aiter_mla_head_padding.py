@@ -74,21 +74,19 @@ def test_kimi_k3_aiter_identity_rope_cache_is_exact_and_shared():
     rope = _get_kimi_k3_no_positional_rotary_embedding(
         rotary_dim=64,
         max_position_embeddings=32,
-        dtype=torch.bfloat16,
         is_neox_style=True,
     )
     same_rope = _get_kimi_k3_no_positional_rotary_embedding(
         rotary_dim=64,
         max_position_embeddings=32,
-        dtype=torch.bfloat16,
         is_neox_style=True,
     )
 
     assert rope is same_rope
     assert rope.cos_cache.shape == (32, 1, 1, 32)
     assert rope.sin_cache.shape == (32, 1, 1, 32)
-    assert rope.cos_cache.dtype == torch.bfloat16
-    assert rope.sin_cache.dtype == torch.bfloat16
+    assert rope.cos_cache.dtype == torch.float32
+    assert rope.sin_cache.dtype == torch.float32
     assert torch.all(rope.cos_cache == 1)
     assert torch.all(rope.sin_cache == 0)
 
