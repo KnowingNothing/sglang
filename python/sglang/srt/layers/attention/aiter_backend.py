@@ -286,17 +286,21 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
-            _valid_heads = self.num_head in (4, 8) or (
+            _valid_heads = 1 <= self.num_head <= 16 or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
             )
             assert _valid_heads, (
-                f"Aiter MLA supports num_head of 4, 8, or multiples of 16 "
-                f"in [16, 128].\n"
+                f"Aiter MLA supports num_head in [1, 16], or multiples of 16 "
+                f"in [16, 128], by padding sub-16 head counts to 16.\n"
                 f"Provided {self.num_head} number of heads.\n"
                 "Try adjusting tensor_parallel_size value."
             )
             self.num_head_padded = 16 if self.num_head < 16 else self.num_head
-            self.head_repeat_factor = 16 // self.num_head if self.num_head < 16 else 1
+            self.head_repeat_factor = (
+                16 // self.num_head
+                if self.num_head < 16 and 16 % self.num_head == 0
+                else 1
+            )
 
             self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -751,10 +755,12 @@ class AiterAttnBackend(AttentionBackend):
     ):
         """Wrap mla_decode_fwd with head-dimension padding for num_head < 16.
 
-        When head_repeat_factor > 1 (i.e. num_head is 4 or 8), q is
-        repeat-interleaved to reach num_head_padded (16) before the kernel
-        call, and the corresponding output columns are sliced back afterward.
-        q / o must already be shaped (..., num_head, head_dim).
+        For a sub-16 head count that divides 16, q is repeat-interleaved and
+        the corresponding output heads are selected afterward. Other sub-16
+        counts (notably Kimi-K3 TP8's 12 heads) append duplicate query heads
+        and slice them back. MLA heads are independent, so duplicate padding
+        cannot affect the returned real heads. q / o must already be shaped
+        (..., num_head, head_dim).
         """
         if self.head_repeat_factor > 1:
             q_in = q.repeat_interleave(self.head_repeat_factor, dim=1)
@@ -764,6 +770,24 @@ class AiterAttnBackend(AttentionBackend):
             )
             mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
             return o[:, :: self.head_repeat_factor, :]
+        elif self.num_head_padded > self.num_head:
+            num_pad_heads = self.num_head_padded - self.num_head
+            if num_pad_heads <= self.num_head:
+                q_padding = q[:, :num_pad_heads, :]
+            else:
+                num_repeats = (
+                    num_pad_heads + self.num_head - 1
+                ) // self.num_head
+                q_padding = q.repeat(1, num_repeats, 1)[
+                    :, :num_pad_heads, :
+                ]
+            q_in = torch.cat((q, q_padding), dim=1)
+            o = q.new_empty(
+                (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
+            return o[:, : self.num_head, :]
         else:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
