@@ -135,16 +135,20 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
 }
 
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
+  return device::warp::inclusive_sum(lane_id, val);
 }
 
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
+#ifndef USE_ROCM
   return __popc(__ballot_sync(mask, pred));
+#else
+  // A HIP ballot covers the physical 64-lane wavefront.  Keep the CUDA
+  // algorithm's logical 32-lane warp semantics by selecting the caller's
+  // lower or upper half-wave before counting set bits.
+  const uint32_t lane_base = threadIdx.x & 32u;
+  const uint64_t logical_mask = static_cast<uint64_t>(mask) << lane_base;
+  return __popcll(__ballot(pred) & logical_mask);
+#endif
 }
 
 struct alignas(8) TieValue {

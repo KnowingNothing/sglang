@@ -181,7 +181,15 @@ SGL_DEVICE uint32_t inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(kWarpThreads == 32);
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
+#ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+#else
+    // CUDA warps are 32 lanes, while gfx9 uses 64-lane wavefronts and HIP's
+    // *_sync intrinsics require a 64-bit mask.  This primitive deliberately
+    // operates on a logical 32-lane group, so use the width-aware HIP shuffle
+    // instead of passing CUDA's 32-bit active mask to __shfl_up_sync.
+    uint32_t n = __shfl_up(val, offset, 32);
+#endif
     if (lane_id >= offset) val += n;
   }
   return val;
