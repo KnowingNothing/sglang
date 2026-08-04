@@ -371,6 +371,67 @@ class MultimodalRequestTestCase(unittest.TestCase):
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
 
+    def test_create_responses_forwards_reasoning_and_routing_metadata(self):
+        serving = make_serving()
+        captured = {}
+        serving._is_thinking_enabled_for_request = Mock(return_value=True)
+        serving._process_messages = Mock(
+            return_value=MessageProcessingResult(
+                prompt="rendered prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+        )
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                        "reasoning_tokens": 1,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        raw_request = Mock()
+        raw_request.headers = {
+            "x-smg-routing-key": "conversation-123",
+            "x-data-parallel-rank": "2",
+        }
+        raw_request.state = Mock()
+        request = ResponsesRequest(
+            model="x",
+            input="hello",
+            request_id="resp_metadata",
+            store=False,
+        )
+
+        response = asyncio.run(serving.create_responses(request, raw_request))
+
+        self.assertEqual(response.status, "completed")
+        adapted_request = captured["adapted_request"]
+        self.assertTrue(adapted_request.require_reasoning)
+        self.assertEqual(adapted_request.routing_key, "conversation-123")
+        self.assertEqual(adapted_request.routed_dp_rank, 2)
+        self.assertEqual(response.usage.reasoning_tokens, 1)
+
 
 class OutputItemsTestCase(unittest.TestCase):
     def _function_tool_request(self):

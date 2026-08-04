@@ -335,6 +335,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         prompt_kwargs = {"input_ids": engine_prompt}
 
+                    require_reasoning = self._is_thinking_enabled_for_request(request)
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request
+                    )
+
                     adapted_request = GenerateReqInput(
                         **prompt_kwargs,
                         image_data=(
@@ -362,6 +367,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         rid=request.request_id,
                         session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
+                        require_reasoning=require_reasoning,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        routing_key=self.extract_routing_key(raw_request),
+                        custom_labels=self.extract_custom_labels(raw_request),
                         background=request.background,
                     )
 
@@ -2380,6 +2389,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 rid=request_id,
                 session_id=adapted_request.session_id,
                 extra_key=adapted_request.extra_key,
+                require_reasoning=adapted_request.require_reasoning,
+                routed_dp_rank=adapted_request.routed_dp_rank,
+                routing_key=adapted_request.routing_key,
+                custom_labels=adapted_request.custom_labels,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,
