@@ -217,6 +217,123 @@ def cast_e2m1fn_to_e4m3fn(
     )
 
 
+def _convert_mxfp4_moe_weights_to_block_fp8(layer: Module) -> None:
+    """Convert packed MXFP4 expert weights to block FP8 without a BF16 roundtrip.
+
+    The destination tensors are allocated once and filled expert by expert so
+    large MoE checkpoints do not temporarily keep two complete FP8 copies.
+    """
+
+    fp8_block_size = 128
+    fp4_block_size = 32
+    num_experts, w13_rows, w13_packed_cols = layer.w13_weight.shape
+    _, w2_rows, w2_packed_cols = layer.w2_weight.shape
+    intermediate_size = w13_rows // 2
+    padded_intermediate_size = (
+        (intermediate_size + fp8_block_size - 1) // fp8_block_size
+    ) * fp8_block_size
+
+    if padded_intermediate_size != intermediate_size:
+        old_w13 = layer.w13_weight.data
+        padded_w13 = torch.zeros(
+            num_experts,
+            2 * padded_intermediate_size,
+            w13_packed_cols,
+            dtype=old_w13.dtype,
+            device=old_w13.device,
+        )
+        padded_w13[:, :intermediate_size, :] = old_w13[:, :intermediate_size, :]
+        padded_w13[
+            :,
+            padded_intermediate_size : padded_intermediate_size + intermediate_size,
+            :,
+        ] = old_w13[:, intermediate_size:, :]
+        layer.w13_weight = Parameter(padded_w13, requires_grad=False)
+
+        old_w13_scale = layer.w13_weight_scale_inv.data
+        padded_w13_scale = torch.zeros(
+            num_experts,
+            2 * padded_intermediate_size,
+            old_w13_scale.shape[2],
+            dtype=old_w13_scale.dtype,
+            device=old_w13_scale.device,
+        )
+        padded_w13_scale[:, :intermediate_size, :] = old_w13_scale[
+            :, :intermediate_size, :
+        ]
+        padded_w13_scale[
+            :,
+            padded_intermediate_size : padded_intermediate_size + intermediate_size,
+            :,
+        ] = old_w13_scale[:, intermediate_size:, :]
+        layer.w13_weight_scale_inv = Parameter(padded_w13_scale, requires_grad=False)
+
+        old_w2 = layer.w2_weight.data
+        padded_w2 = torch.zeros(
+            num_experts,
+            w2_rows,
+            padded_intermediate_size // 2,
+            dtype=old_w2.dtype,
+            device=old_w2.device,
+        )
+        padded_w2[:, :, :w2_packed_cols] = old_w2
+        layer.w2_weight = Parameter(padded_w2, requires_grad=False)
+
+        old_w2_scale = layer.w2_weight_scale_inv.data
+        padded_w2_scale = torch.zeros(
+            num_experts,
+            w2_rows,
+            padded_intermediate_size // fp4_block_size,
+            dtype=old_w2_scale.dtype,
+            device=old_w2_scale.device,
+        )
+        padded_w2_scale[:, :, : old_w2_scale.shape[2]] = old_w2_scale
+        layer.w2_weight_scale_inv = Parameter(padded_w2_scale, requires_grad=False)
+
+    layer.intermediate_pad = padded_intermediate_size - intermediate_size
+    layer.hidden_pad = 0
+
+    def convert(weight: Parameter, scale: Parameter) -> tuple[Parameter, Parameter]:
+        experts, out_dim, packed_in_dim = weight.shape
+        in_dim = packed_in_dim * 2
+        converted_weight = torch.empty(
+            experts,
+            out_dim,
+            in_dim,
+            dtype=torch.float8_e4m3fn,
+            device=weight.device,
+        )
+        converted_scale = torch.empty(
+            experts,
+            out_dim // fp8_block_size,
+            in_dim // fp8_block_size,
+            dtype=torch.float32,
+            device=scale.device,
+        )
+        for expert_id in range(experts):
+            expert_scale_source = scale.data[expert_id]
+            if expert_scale_source.dtype == torch.uint8:
+                expert_scale_source = expert_scale_source.view(torch.float8_e8m0fnu)
+            expert_weight, expert_scale = cast_e2m1fn_to_e4m3fn(
+                weight.data[expert_id], expert_scale_source
+            )
+            converted_weight[expert_id].copy_(expert_weight)
+            converted_scale[expert_id].copy_(expert_scale.float())
+        converted_weight_param = Parameter(converted_weight, requires_grad=False)
+        converted_scale_param = Parameter(converted_scale, requires_grad=False)
+        converted_scale_param.format_ue8m0 = False
+        return converted_weight_param, converted_scale_param
+
+    layer.w13_weight, layer.w13_weight_scale_inv = convert(
+        layer.w13_weight, layer.w13_weight_scale_inv
+    )
+    layer.w2_weight, layer.w2_weight_scale_inv = convert(
+        layer.w2_weight, layer.w2_weight_scale_inv
+    )
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -1053,6 +1170,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
+        self.compressed_tensors_mxfp4 = getattr(
+            self.quant_config, "compressed_tensors_mxfp4", False
+        )
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -1380,8 +1500,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_fp4_expert=self.is_fp4_expert,
             params_dtype=params_dtype,
             with_bias=with_bias,
+            fp4_scale_dtype=(torch.uint8 if self.compressed_tensors_mxfp4 else None),
             **extra_weight_attrs,
         )
+
+        if self.compressed_tensors_mxfp4:
+            # compressed-tensors checkpoints call this tensor `weight_scale`,
+            # while Fp8MoEMethod uses `weight_scale_inv` after conversion.
+            layer.register_parameter(
+                "w13_weight_scale",
+                layer._parameters.pop("w13_weight_scale_inv"),
+            )
+            layer.register_parameter(
+                "w2_weight_scale",
+                layer._parameters.pop("w2_weight_scale_inv"),
+            )
 
         if (
             not self.is_fp4_expert
@@ -1391,6 +1524,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._ensure_cutlass_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # Run the portable conversion before any native MXFP4 backend handles
+        # or shuffles the packed checkpoint tensors. After conversion the
+        # normal block-FP8 ROCm path below normalizes and shuffles the weights.
+        if self.is_fp4_expert and self.dequant_fp4_to_fp8:
+            if self.compressed_tensors_mxfp4:
+                layer.register_parameter(
+                    "w13_weight_scale_inv",
+                    layer._parameters.pop("w13_weight_scale"),
+                )
+                layer.register_parameter(
+                    "w2_weight_scale_inv",
+                    layer._parameters.pop("w2_weight_scale"),
+                )
+            _convert_mxfp4_moe_weights_to_block_fp8(layer)
+            self.is_fp4_expert = False
+            self.weight_block_size = [128, 128]
+            self.quant_config.weight_block_size = [128, 128]
+            logger.warning_once("Dequantized MXFP4 expert weights to block FP8.")
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1597,26 +1749,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
-
-            if self.is_fp4_expert and self.dequant_fp4_to_fp8:
-                for weight_param, scale_param in [
-                    (layer.w13_weight, layer.w13_weight_scale_inv),
-                    (layer.w2_weight, layer.w2_weight_scale_inv),
-                ]:
-                    num_experts = weight_param.shape[0]
-                    new_weights = []
-                    new_scales = []
-                    for e in range(num_experts):
-                        w, s = cast_e2m1fn_to_e4m3fn(
-                            weight_param.data[e], scale_param.data[e]
-                        )
-                        new_weights.append(w)
-                        new_scales.append(s)
-                    weight_param.data = torch.stack(new_weights)
-                    scale_param.data = torch.stack(new_scales).float()
-                    scale_param.format_ue8m0 = False
-                self.is_fp4_expert = False
-                logger.warning_once("Dequantized FP4 expert weights to FP8.")
 
             if self.is_fp4_expert:
                 if get_moe_runner_backend().is_marlin():
@@ -2202,9 +2334,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_weight_scale1[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -2426,7 +2558,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=output)
 
         if self.runner.runner_backend.is_deep_gemm():
-
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 

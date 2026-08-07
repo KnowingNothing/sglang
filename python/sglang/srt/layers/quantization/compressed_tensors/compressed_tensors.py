@@ -30,6 +30,7 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -62,7 +63,11 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     is_activation_quantization_format,
     should_ignore_layer,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -182,6 +187,21 @@ class CompressedTensorsConfig(QuantizationConfig):
             # dedicated FusedMoEMethodBase (Mxfp4MoEMethod) that already
             # handles all MoE backends, bypassing the scheme abstraction.
             if self._is_mxfp4_moe(layer_name=prefix):
+                if envs.SGLANG_MXFP4_DEQUANT_TO_FP8.get():
+                    fp8_config = Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        activation_scheme="dynamic",
+                        weight_block_size=[128, 128],
+                        is_fp4_experts=True,
+                    )
+                    fp8_config.dequant_fp4_to_fp8 = True
+                    fp8_config.compressed_tensors_mxfp4 = True
+                    logger.warning_once(
+                        "Converting compressed-tensors MXFP4 MoE weights "
+                        "losslessly to 128x128 block FP8 at load time"
+                    )
+                    return Fp8MoEMethod(fp8_config)
+
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
