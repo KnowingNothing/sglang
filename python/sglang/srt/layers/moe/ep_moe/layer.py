@@ -95,6 +95,15 @@ class DeepEPMoE(FusedMoE):
             self.deprecate_flag = True
         elif _is_npu:
             self.deprecate_flag = True
+        elif (
+            get_moe_a2a_backend().is_mori()
+            and get_moe_runner_backend().is_triton()
+        ):
+            # MORI dispatch needs the unified runner's format adapter:
+            # its receive buffer has global expert ids and a device-side live
+            # token count. The legacy path below only handles CUTLASS W4A8 and
+            # otherwise deliberately rejects its removed DeepGEMM entrypoint.
+            self.deprecate_flag = True
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
             quant_config, Fp8Config
         ):

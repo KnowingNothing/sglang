@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
@@ -85,7 +85,9 @@ class MoriEPNormalDispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
+    # MORI returns the live receive count as a one-element device tensor. The
+    # name is retained for compatibility with the DeepEP dispatch contract.
+    num_recv_tokens_per_expert: torch.Tensor
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype
@@ -102,7 +104,7 @@ class MoriEPLLDispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
+    num_recv_tokens_per_expert: torch.Tensor
     origin_topk_ids: torch.Tensor
     origin_topk_weights: torch.Tensor
     out_dtype: torch.dtype

@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
@@ -83,6 +84,17 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
+        if runner_input.hidden_states.shape[0] == 0:
+            if self.config.no_combine:
+                topk = runner_input.topk_ids.shape[-1]
+                hidden_size = runner_input.hidden_states.shape[-1]
+                return TritonRunnerOutput(
+                    hidden_states=runner_input.hidden_states.new_empty(
+                        (0, topk, hidden_size)
+                    )
+                )
+            return TritonRunnerOutput(hidden_states=runner_input.hidden_states)
+
         if quant_info.use_mxfp8 and is_hip() and is_gfx95_supported():
             from sglang.kernels.ops.moe.mxfp8_moe_amd_gfx95 import (
                 fused_experts_mxfp8,
@@ -315,3 +327,245 @@ def post_permute_triton_to_standard(
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
     )
+
+
+def _compact_mori_routes(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    global_topk_ids: torch.Tensor,
+    *,
+    expert_offset: int,
+    num_local_experts: int,
+):
+    """Turn MORI's received global routes into compact local top-k=1 rows."""
+
+    local_topk_ids = global_topk_ids.to(torch.int64) - expert_offset
+    valid = (local_topk_ids >= 0) & (local_topk_ids < num_local_experts)
+    local_topk_ids = torch.where(
+        valid, local_topk_ids, torch.full_like(local_topk_ids, -1)
+    ).to(torch.int32)
+
+    valid_positions = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
+    token_indices = torch.div(
+        valid_positions, global_topk_ids.shape[1], rounding_mode="floor"
+    )
+
+    compact_hidden_states = hidden_states.index_select(0, token_indices)
+    compact_topk_ids = (
+        local_topk_ids.reshape(-1).index_select(0, valid_positions).reshape(-1, 1)
+    )
+    compact_topk_weights = torch.ones(
+        (valid_positions.numel(), 1),
+        dtype=topk_weights.dtype,
+        device=topk_weights.device,
+    )
+
+    output_index = torch.full_like(local_topk_ids, -1, dtype=torch.int32)
+    if valid_positions.numel() > 0:
+        output_index.reshape(-1).index_copy_(
+            0,
+            valid_positions,
+            torch.arange(
+                valid_positions.numel(),
+                dtype=torch.int32,
+                device=valid_positions.device,
+            ),
+        )
+
+    return (
+        compact_hidden_states,
+        compact_topk_weights,
+        compact_topk_ids,
+        local_topk_ids,
+        output_index,
+    )
+
+
+@register_pre_permute("deepep_ll", "triton")
+@register_pre_permute("deepep_normal", "triton")
+def pre_permute_mori_to_triton(
+    dispatch_output,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    """Adapt MORI normal or low-latency dispatch to the Triton MoE runner."""
+
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
+    )
+
+    if not hasattr(dispatch_output, "origin_topk_ids"):
+        raise NotImplementedError(
+            "Triton DeepEP-format pre-permute currently supports MORI only"
+        )
+    if runner_config.no_combine:
+        raise NotImplementedError("MORI + Triton does not support no_combine=True")
+    if runner_config.apply_router_weight_on_input:
+        raise NotImplementedError(
+            "MORI + Triton does not support apply_router_weight_on_input=True"
+        )
+
+    total_recv_tensor = dispatch_output.num_recv_tokens_per_expert
+    if total_recv_tensor.numel() != 1:
+        raise ValueError(
+            "MORI dispatch must provide a one-element total receive count, got "
+            f"shape={tuple(total_recv_tensor.shape)}"
+        )
+    # MORI allocates a fixed-capacity receive arena. Triton must only process
+    # the live prefix. The scalar sync is correctness-first and can later be
+    # replaced by a device-count-aware compaction kernel.
+    total_recv = int(total_recv_tensor.item())
+
+    hidden_states = dispatch_output.hidden_states[:total_recv]
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    if hidden_states_scale is not None:
+        from sglang.kernels.ops.moe.rocm_moe_utils import upscale, upscale_mxfp4
+
+        hidden_states_scale = hidden_states_scale[:total_recv]
+        if hidden_states.dtype == torch.float4_e2m1fn_x2:
+            hidden_states = upscale_mxfp4(
+                hidden_states,
+                hidden_states_scale,
+                total_recv_tensor,
+                dispatch_output.out_dtype,
+            )
+        else:
+            hidden_states = upscale(
+                hidden_states,
+                hidden_states_scale,
+                total_recv_tensor,
+                dispatch_output.out_dtype,
+            )
+
+    global_topk_ids = dispatch_output.topk_ids[:total_recv]
+    topk_weights = dispatch_output.topk_weights[:total_recv]
+    expert_offset = get_parallel().moe_ep_rank * runner_config.num_local_experts
+
+    (
+        compact_hidden_states,
+        compact_topk_weights,
+        compact_topk_ids,
+        local_topk_ids,
+        output_index,
+    ) = _compact_mori_routes(
+        hidden_states,
+        topk_weights,
+        global_topk_ids,
+        expert_offset=expert_offset,
+        num_local_experts=runner_config.num_local_experts,
+    )
+
+    running_state["triton_mori_local_topk_ids"] = local_topk_ids
+    running_state["triton_mori_topk_weights"] = topk_weights
+    running_state["triton_mori_output_index"] = output_index
+    running_state["triton_mori_total_recv"] = total_recv
+    running_state["triton_mori_hidden_size"] = hidden_states.shape[1]
+    running_state["triton_mori_output_dtype"] = dispatch_output.out_dtype
+    running_state["triton_mori_origin_topk_ids"] = dispatch_output.origin_topk_ids
+    running_state["triton_mori_origin_topk_weights"] = (
+        dispatch_output.origin_topk_weights
+    )
+
+    if compact_hidden_states.shape[0] == 0:
+        empty_i32 = torch.empty(
+            (0,), dtype=torch.int32, device=compact_hidden_states.device
+        )
+        return TritonRunnerInput(
+            hidden_states=compact_hidden_states,
+            topk_weights=compact_topk_weights,
+            topk_ids=compact_topk_ids,
+            sorted_token_ids=empty_i32,
+            expert_ids=empty_i32,
+            num_tokens_post_padded=torch.zeros(
+                (1,), dtype=torch.int32, device=compact_hidden_states.device
+            ),
+        )
+
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        compact_hidden_states,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        compact_topk_ids,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        block_shape=quant_info.block_shape,
+    )
+    running_state["config"] = config
+    running_state["down_config"] = down_config
+    running_state["down_moe_use_tma"] = down_moe_use_tma
+
+    return TritonRunnerInput(
+        hidden_states=compact_hidden_states,
+        topk_weights=compact_topk_weights,
+        topk_ids=compact_topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+def _post_permute_triton_to_mori(
+    runner_output: TritonRunnerOutput,
+    running_state: dict,
+    *,
+    is_normal: bool,
+):
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
+    from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        MoriEPLLCombineInput,
+        MoriEPNormalCombineInput,
+    )
+
+    total_recv = running_state["triton_mori_total_recv"]
+    hidden_size = running_state["triton_mori_hidden_size"]
+    recv_output = torch.empty(
+        (total_recv, hidden_size),
+        dtype=running_state["triton_mori_output_dtype"],
+        device=runner_output.hidden_states.device,
+    )
+    if total_recv > 0:
+        ep_gather(
+            runner_output.hidden_states,
+            running_state["triton_mori_local_topk_ids"],
+            running_state["triton_mori_topk_weights"],
+            running_state["triton_mori_output_index"],
+            recv_output,
+        )
+
+    combine_cls = MoriEPNormalCombineInput if is_normal else MoriEPLLCombineInput
+    return combine_cls(
+        hidden_states=recv_output,
+        topk_ids=running_state["triton_mori_origin_topk_ids"],
+        topk_weights=running_state["triton_mori_origin_topk_weights"],
+    )
+
+
+@register_post_permute("triton", "deepep_normal")
+def post_permute_triton_to_mori_normal(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    return _post_permute_triton_to_mori(runner_output, running_state, is_normal=True)
+
+
+@register_post_permute("triton", "deepep_ll")
+def post_permute_triton_to_mori_low_latency(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    return _post_permute_triton_to_mori(runner_output, running_state, is_normal=False)
