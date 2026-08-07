@@ -48,7 +48,11 @@ MXFP4_BLOCK_SIZE = 32
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _use_aiter:
+# MoRI's FP8/FP4 transport quantizers come from AITER even when AITER is not
+# selected as the model attention/MoE backend.  Gating these imports on
+# SGLANG_USE_AITER leaves the normal and low-latency MoRI dispatchers with
+# undefined symbols when a deployment combines Triton compute with MoRI A2A.
+if _is_hip:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
