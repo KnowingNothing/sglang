@@ -9,6 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+_SGLANG_USE_JIT_MOE_ALIGN = envs.SGLANG_USE_JIT_MOE_ALIGN.get()
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -94,11 +95,11 @@ def moe_align_block_size(
     )
 
     # ===== TO BE REFACTORED ====
-    use_jit_align = False
+    use_jit_align = _SGLANG_USE_JIT_MOE_ALIGN
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
-        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+        use_jit_align |= lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
     if use_jit_align:
         from sglang.kernels.ops.moe.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,

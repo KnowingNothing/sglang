@@ -43,7 +43,15 @@ inline uint32_t next_pow2(uint32_t x) noexcept {
 
 namespace moe {
 
-__device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
+#if defined(__HIP_PLATFORM_AMD__)
+using WarpMask = unsigned long long;
+constexpr WarpMask kFullWarpMask = 0xffffffffffffffffull;
+#else
+using WarpMask = unsigned;
+constexpr WarpMask kFullWarpMask = 0xffffffffu;
+#endif
+
+__device__ __forceinline__ int warp_exclusive_scan(int v, WarpMask mask = kFullWarpMask) {
   int original = v;
 #pragma unroll
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {

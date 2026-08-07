@@ -592,6 +592,11 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # Use the JIT MoE token-alignment kernel instead of the prebuilt sgl-kernel
+    # operator. This is an independent serving fallback (not tied to the
+    # experimental LoRA optimizations) and is useful on ROCm platforms where
+    # the prebuilt moe_align_block_size operator is unavailable or unstable.
+    SGLANG_USE_JIT_MOE_ALIGN = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
 
     # MPS (Apple Silicon)
