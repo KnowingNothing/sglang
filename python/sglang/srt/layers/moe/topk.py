@@ -131,6 +131,16 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
+# Kimi-K3 on ROCm can fall back to this PyTorch implementation when the AITER
+# router is intentionally disabled (for example, when Triton owns the MoE
+# runner).  Keep the eager implementation available as an opt-in escape hatch:
+# some ROCm images cannot compile this function with Inductor even though the
+# underlying eager tensor operations are supported.
+_disable_compiled_biased_grouped_topk = _is_npu or (
+    _is_hip
+    and get_bool_env_var("SGLANG_DISABLE_COMPILED_BIASED_GROUPED_TOPK", "False")
+)
+
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
 # and flashinfer's trtllm routing kernels (mSumEpsilon). With sigmoid scoring
@@ -1261,7 +1271,11 @@ def biased_topk_jit_kernel_impl(
         return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(
+    dynamic=True,
+    backend=get_compiler_backend(),
+    disable=_disable_compiled_biased_grouped_topk,
+)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
