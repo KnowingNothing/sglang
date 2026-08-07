@@ -104,6 +104,22 @@ class TestTopkRenormalizeDegenerate(CustomTestCase):
         )
         self._check(weights, "biased_grouped_topk_impl")
 
+    def test_biased_grouped_topk_impl_empty_batch(self):
+        hidden, logits, bias = self._inputs(num_tokens=0, degenerate_rows=())
+        weights, ids = biased_grouped_topk_impl(
+            hidden,
+            logits,
+            bias,
+            topk=TOPK,
+            renormalize=True,
+            num_expert_group=8,
+            topk_group=4,
+        )
+        self.assertEqual(weights.shape, (0, TOPK))
+        self.assertEqual(weights.dtype, torch.float32)
+        self.assertEqual(ids.shape, (0, TOPK))
+        self.assertEqual(ids.dtype, torch.int32)
+
     def test_kimi_k2_biased_topk_impl(self):
         hidden, logits, bias = self._inputs()
         weights, _ = kimi_k2_biased_topk_impl(

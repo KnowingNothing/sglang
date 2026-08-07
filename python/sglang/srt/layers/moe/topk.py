@@ -1293,9 +1293,15 @@ def biased_grouped_topk_impl(
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    # Keep the expert dimension explicit so zero-token DP ranks remain valid.
+    # ``view(0, -1)`` is ambiguous because PyTorch cannot infer the missing
+    # dimension from a zero-element tensor.  This path is exercised by
+    # DP-attention when an idle/health-check batch has no tokens on some ranks.
+    scores_for_choice = scores + correction_bias.unsqueeze(0)
     group_scores = (
-        scores_for_choice.view(num_token, num_expert_group, -1)
+        scores_for_choice.view(
+            num_token, num_expert_group, num_experts // num_expert_group
+        )
         .topk(2, dim=-1)[0]
         .sum(dim=-1)
     )  # [n, n_group]
@@ -1307,7 +1313,7 @@ def biased_grouped_topk_impl(
     score_mask = (
         group_mask.unsqueeze(-1)
         .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
-        .reshape(num_token, -1)
+        .reshape(num_token, num_experts)
     )  # [n, e]
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
