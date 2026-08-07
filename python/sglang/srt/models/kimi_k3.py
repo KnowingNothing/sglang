@@ -118,6 +118,34 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+
+
+def _get_kimi_k3_moe_quant_config(
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    """Select the routed-expert quantization path for Kimi-K3.
+
+    Kimi-K3 historically replaces compressed-tensors MXFP4 with the native
+    ``Mxfp4Config`` fast path.  Keep the original compressed-tensors config
+    when the portable MXFP4-to-block-FP8 fallback is requested, so
+    ``CompressedTensorsConfig.get_quant_method`` can construct the configured
+    ``Fp8MoEMethod`` instead of being bypassed here.
+    """
+    if quant_config is None:
+        return None
+
+    quant_format = getattr(quant_config, "quant_format", None)
+    if not quant_format or "mxfp4" not in quant_format:
+        return quant_config
+
+    if envs.SGLANG_MXFP4_DEQUANT_TO_FP8.get():
+        return quant_config
+
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+
+    return Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+
+
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 # ---------------------------------------------------------------------------
@@ -469,14 +497,10 @@ class KimiK3MoE(nn.Module):
         # full precision (matches GateLinear in mke). codespell:ignore mke
         self.gate = MoEGate(config, quant_config=None, prefix=f"{prefix}.gate")
 
-        # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
-        # so FusedMoE's weight_loader uses the MXFP4 fast path
-        moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None):
-            if "mxfp4" in quant_config.quant_format:
-                from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-
-                moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+        # Use the native MXFP4 path by default.  On architectures without a
+        # production MXFP4 MoE kernel, preserve the compressed-tensors config
+        # so its opt-in load-time block-FP8 fallback can take over.
+        moe_quant_config = _get_kimi_k3_moe_quant_config(quant_config)
 
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
@@ -2846,7 +2870,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
+            # compressed-tensors MXFP4 stores as weight_packed; both the native
+            # Mxfp4MoEMethod and the block-FP8 fallback load it as weight.
             if "weight_packed" in name:
                 name = name.replace("weight_packed", "weight")
 

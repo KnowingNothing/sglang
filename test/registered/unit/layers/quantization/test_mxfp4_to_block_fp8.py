@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -6,9 +7,29 @@ from torch import nn
 from sglang.srt.layers.quantization.fp8 import (
     _convert_mxfp4_moe_weights_to_block_fp8,
 )
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+from sglang.srt.models.kimi_k3 import _get_kimi_k3_moe_quant_config
 
 
 class TestMxfp4ToBlockFp8(unittest.TestCase):
+    def test_kimi_k3_preserves_compressed_config_for_fallback(self):
+        class CompressedConfig:
+            quant_format = "mxfp4-pack-quantized"
+
+        config = CompressedConfig()
+        with patch.dict("os.environ", {"SGLANG_MXFP4_DEQUANT_TO_FP8": "1"}):
+            self.assertIs(_get_kimi_k3_moe_quant_config(config), config)
+
+    def test_kimi_k3_uses_native_mxfp4_by_default(self):
+        class CompressedConfig:
+            quant_format = "mxfp4-pack-quantized"
+
+        with patch.dict("os.environ", {"SGLANG_MXFP4_DEQUANT_TO_FP8": "0"}):
+            config = _get_kimi_k3_moe_quant_config(CompressedConfig())
+
+        self.assertIsInstance(config, Mxfp4Config)
+        self.assertTrue(config.is_checkpoint_mxfp4_serialized)
+
     def test_tp_shard_padding_and_conversion(self):
         layer = nn.Module()
         num_experts = 1
