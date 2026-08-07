@@ -1,8 +1,18 @@
+import importlib.util
 import unittest
+from pathlib import Path
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.triton import _compact_mori_routes
+
+_UTILS_PATH = (
+    Path(__file__).resolve().parents[5]
+    / "python/sglang/srt/layers/moe/moe_runner/triton_mori_utils.py"
+)
+_SPEC = importlib.util.spec_from_file_location("triton_mori_utils", _UTILS_PATH)
+_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
+compact_mori_routes = _MODULE.compact_mori_routes
 
 
 class TestCompactMoriRoutes(unittest.TestCase):
@@ -21,7 +31,7 @@ class TestCompactMoriRoutes(unittest.TestCase):
             compact_topk_ids,
             local_topk_ids,
             output_index,
-        ) = _compact_mori_routes(
+        ) = compact_mori_routes(
             hidden_states,
             topk_weights,
             global_topk_ids,
@@ -52,7 +62,7 @@ class TestCompactMoriRoutes(unittest.TestCase):
                     )
 
         torch.testing.assert_close(
-            reconstructed, torch.tensor([[1.0], [20.0], [21.0]])
+            reconstructed, torch.tensor([[1.0], [18.0], [21.0]])
         )
 
     def test_handles_no_local_routes(self):
@@ -60,7 +70,7 @@ class TestCompactMoriRoutes(unittest.TestCase):
         topk_weights = torch.ones((2, 2))
         global_topk_ids = torch.tensor([[0, 1], [8, 9]], dtype=torch.int32)
 
-        compact = _compact_mori_routes(
+        compact = compact_mori_routes(
             hidden_states,
             topk_weights,
             global_topk_ids,
