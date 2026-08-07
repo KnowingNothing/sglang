@@ -1233,7 +1233,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             is_packed=False,
         )
 
-        if block_quant:
+        # The portable MXFP4 -> block-FP8 path first allocates the checkpoint's
+        # packed FP4 tensors at their real TP-sharded size, then pads them to
+        # the destination FP8 block shape during post-load conversion. Applying
+        # the destination block divisibility check here rejects valid shards
+        # such as K3 TP32's intermediate_size_per_partition=96 before that
+        # padding can happen.
+        skip_block_shape_check_for_fp4_conversion = is_fp4_expert and getattr(
+            quant_config, "dequant_fp4_to_fp8", False
+        )
+        if block_quant and not skip_block_shape_check_for_fp4_conversion:
             block_n, block_k = (
                 quant_config.weight_block_size[0],
                 quant_config.weight_block_size[1],
