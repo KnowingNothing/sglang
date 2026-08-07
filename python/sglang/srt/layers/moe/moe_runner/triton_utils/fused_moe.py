@@ -95,7 +95,14 @@ padding_size = get_moe_padding_size(_use_aiter)
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
-    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+    # ROCm already has a Triton reduction fallback below.  Avoid routing small
+    # HIP batches through Inductor: some ROCm serving images cannot compile the
+    # static @torch.compile wrapper even though the Triton kernel is supported.
+    return (
+        not _is_hip
+        and num_tokens <= 32
+        and not is_batch_invariant_mode_enabled()
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
