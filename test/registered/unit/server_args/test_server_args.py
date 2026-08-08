@@ -25,7 +25,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    get_dp_attention_handshake_address,
+    prepare_server_args,
+)
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -814,6 +819,18 @@ class TestContextParallelServerArgs(CustomTestCase):
 
 
 class TestPortArgs(unittest.TestCase):
+    @staticmethod
+    def _explicit_dp_attention_port_plan():
+        return {
+            "tokenizer": 11001,
+            "detokenizer": 11003,
+            "rpc": 11005,
+            "metrics": 11007,
+            "scheduler": 11009,
+            "load_collector": 11011,
+            "handshake": 11013,
+        }
+
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
@@ -928,6 +945,140 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_explicit_dp_attention_port_plan(
+        self, mock_wait_port_available
+    ):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30000
+        server_args.nccl_port = 12000
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 4
+        server_args.node_rank = 0
+        server_args.dist_init_addr = "192.168.1.1:10000"
+        server_args.dp_attention_port_plan = self._explicit_dp_attention_port_plan()
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertEqual(port_args.tokenizer_ipc_name, "tcp://192.168.1.1:11001")
+        self.assertEqual(port_args.detokenizer_ipc_name, "tcp://192.168.1.1:11003")
+        self.assertEqual(port_args.rpc_ipc_name, "tcp://192.168.1.1:11005")
+        self.assertEqual(port_args.metrics_ipc_name, "tcp://192.168.1.1:11007")
+        self.assertEqual(
+            port_args.scheduler_input_ipc_name, "tcp://192.168.1.1:11009"
+        )
+        self.assertEqual(
+            port_args.load_collector_ipc_name, "tcp://192.168.1.1:11011"
+        )
+        self.assertEqual(
+            get_dp_attention_handshake_address(server_args).to_tcp(),
+            "tcp://192.168.1.1:11013",
+        )
+        self.assertEqual(
+            mock_wait_port_available.call_args_list,
+            [
+                call(10000, "dist_init_port"),
+                call(11001, "tokenizer_port"),
+                call(11003, "detokenizer_port"),
+                call(12000, "nccl_port"),
+                call(11005, "rpc_port"),
+                call(11007, "metrics_port"),
+                call(11011, "load_collector_port"),
+                call(11013, "dp_attention_handshake_port"),
+                call(11009, "scheduler_input_port"),
+            ],
+        )
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_explicit_dp_attention_shared_ports_checked_only_on_node_zero(
+        self, mock_wait_port_available
+    ):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30001
+        server_args.nccl_port = 12000
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 4
+        server_args.node_rank = 1
+        server_args.dist_init_addr = "192.168.1.1:10000"
+        server_args.dp_attention_port_plan = self._explicit_dp_attention_port_plan()
+
+        port_args = PortArgs.init_new(server_args)
+
+        self.assertEqual(port_args.tokenizer_ipc_name, "tcp://192.168.1.1:11001")
+        mock_wait_port_available.assert_not_called()
+
+    def test_explicit_dp_attention_port_plan_requires_exact_unique_ports(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 2
+        server_args.dist_init_addr = "192.168.1.1:10000"
+        server_args.dp_attention_port_plan = self._explicit_dp_attention_port_plan()
+        del server_args.dp_attention_port_plan["handshake"]
+
+        with self.assertRaisesRegex(ValueError, "keys mismatch"):
+            PortArgs.init_new(server_args)
+
+        server_args.dp_attention_port_plan = self._explicit_dp_attention_port_plan()
+        server_args.dp_attention_port_plan["handshake"] = 11001
+        with self.assertRaisesRegex(ValueError, "must be unique"):
+            PortArgs.init_new(server_args)
+
+    @patch("sglang.srt.server_args.get_free_port", return_value=11001)
+    def test_explicit_dp_attention_port_plan_rejects_resolved_port_overlap(
+        self, _mock_get_free_port
+    ):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 2
+        server_args.dist_init_addr = "192.168.1.1:10000"
+        server_args.dp_attention_port_plan = self._explicit_dp_attention_port_plan()
+
+        with self.assertRaisesRegex(ValueError, "resolved distributed port"):
+            PortArgs.init_new(server_args)
+
+    def test_explicit_dp_attention_joiner_uses_primary_handshake_host(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = 30001
+        server_args.host = "10.0.0.2"
+        server_args.enable_dp_attention = True
+        server_args.nnodes = 4
+        server_args.node_rank = 4
+        server_args.dist_init_addr = "10.0.0.1:10000"
+        server_args.ep_join_mode = "scale"
+        server_args.ep_join_rank_offset = 32
+        server_args.dp_attention_port_plan = self._explicit_dp_attention_port_plan()
+
+        self.assertTrue(server_args.is_ep_scale_joiner)
+        self.assertEqual(
+            get_dp_attention_handshake_address(server_args).to_tcp(),
+            "tcp://10.0.0.1:11013",
+        )
+
+    def test_explicit_dp_attention_port_plan_cli_round_trip(self):
+        plan = self._explicit_dp_attention_port_plan()
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-dp-attention",
+                "--dp-size",
+                "2",
+                "--tp-size",
+                "2",
+                "--nnodes",
+                "2",
+                "--node-rank",
+                "0",
+                "--dist-init-addr",
+                "192.168.1.1:10000",
+                "--dp-attention-port-plan",
+                json.dumps(plan),
+            ]
+        )
+
+        self.assertEqual(server_args.dp_attention_port_plan, plan)
 
     def test_init_new_with_malformed_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")

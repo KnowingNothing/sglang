@@ -1196,6 +1196,20 @@ class ServerArgs:
         "With DP-attention, send control messages to every DP group leader and broadcast within attn_tp_group instead of the full tp_group. Eliminates a costly all-ranks gloo sync on every scheduler iteration.",
         NS("parallel"),
     ] = False
+    dp_attention_port_plan: A[
+        Optional[Dict[str, int]],
+        Arg(
+            help=(
+                "Explicit multi-node DP-attention TCP port plan as JSON. "
+                "Required keys: tokenizer, detokenizer, rpc, metrics, scheduler, "
+                "load_collector, handshake. Use platform-reserved ports when the "
+                "default consecutive ports derived from --dist-init-addr can overlap "
+                "the host ephemeral-port range."
+            ),
+            type_parser=json.loads,
+        ),
+        NS("parallel"),
+    ] = None
     enable_dp_lm_head: A[
         bool,
         Arg(
@@ -9366,6 +9380,84 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+DP_ATTENTION_PORT_PLAN_KEYS = (
+    "tokenizer",
+    "detokenizer",
+    "rpc",
+    "metrics",
+    "scheduler",
+    "load_collector",
+    "handshake",
+)
+
+
+def get_dp_attention_port_plan(server_args: ServerArgs) -> Optional[Dict[str, int]]:
+    plan = server_args.dp_attention_port_plan
+    if plan is None:
+        return None
+    if not server_args.enable_dp_attention:
+        raise ValueError(
+            "--dp-attention-port-plan requires --enable-dp-attention."
+        )
+    if not isinstance(plan, dict):
+        raise ValueError("--dp-attention-port-plan must be a JSON object.")
+
+    expected = set(DP_ATTENTION_PORT_PLAN_KEYS)
+    actual = set(plan)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    if missing or extra:
+        raise ValueError(
+            "--dp-attention-port-plan keys mismatch: "
+            f"missing={missing}, extra={extra}."
+        )
+
+    normalized = {}
+    for name in DP_ATTENTION_PORT_PLAN_KEYS:
+        port = plan[name]
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise ValueError(
+                f"--dp-attention-port-plan {name} must be an integer, got {port!r}."
+            )
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                f"--dp-attention-port-plan {name} has invalid port {port}."
+            )
+        normalized[name] = port
+
+    if len(set(normalized.values())) != len(normalized):
+        raise ValueError("--dp-attention-port-plan ports must be unique.")
+
+    reserved = {server_args.nccl_port}
+    if server_args.node_rank == 0:
+        reserved.add(server_args.port)
+    if server_args.dist_init_addr is not None:
+        reserved.add(NetworkAddress.parse(server_args.dist_init_addr).port)
+    conflicts = sorted(set(normalized.values()) & (reserved - {None}))
+    if conflicts:
+        raise ValueError(
+            "--dp-attention-port-plan overlaps another server port: "
+            f"{conflicts}."
+        )
+    return normalized
+
+
+def get_dp_attention_handshake_address(server_args: ServerArgs) -> NetworkAddress:
+    if server_args.dist_init_addr is None:
+        address = NetworkAddress(
+            server_args.host or "127.0.0.1",
+            server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+        )
+    else:
+        primary = NetworkAddress.parse(server_args.dist_init_addr)
+        address = NetworkAddress(
+            primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+        )
+
+    plan = get_dp_attention_port_plan(server_args)
+    if plan is not None:
+        address = NetworkAddress(address.host, plan["handshake"])
+    return address
 
 
 @dataclasses.dataclass
@@ -9463,6 +9555,16 @@ class PortArgs:
 
             dist_init_host = na.host
             dist_init_port = na.port
+            port_plan = get_dp_attention_port_plan(server_args)
+            if port_plan is not None:
+                conflicts = sorted(
+                    set(port_plan.values()) & {dist_init_port, nccl_port}
+                )
+                if conflicts:
+                    raise ValueError(
+                        "--dp-attention-port-plan overlaps a resolved "
+                        f"distributed port: {conflicts}."
+                    )
 
             # We need 5 consecutive ports from port_base for:
             # port_base, detokenizer, rpc, metrics, scheduler.
@@ -9471,23 +9573,34 @@ class PortArgs:
             # (no availability-based search). If incrementing would
             # overflow the valid TCP range, decrement instead.
             NUM_DERIVED_PORTS = 5
-            if server_args.is_ep_joiner:
+            if port_plan is not None:
+                tokenizer_port = port_plan["tokenizer"]
+                detokenizer_port = port_plan["detokenizer"]
+                rpc_port = port_plan["rpc"]
+                metrics_port = port_plan["metrics"]
+                scheduler_input_port = port_plan["scheduler"]
+                load_collector_port = port_plan["load_collector"]
+            elif server_args.is_ep_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
+                tokenizer_port = port_base
             elif dist_init_port + NUM_DERIVED_PORTS > 65535:
                 port_base = dist_init_port - NUM_DERIVED_PORTS - 1
+                tokenizer_port = port_base
             else:
                 port_base = dist_init_port + 1
+                tokenizer_port = port_base
 
-            detokenizer_port = port_base + 1
-            rpc_port = port_base + 2
-            metrics_port = port_base + 3
-            load_collector_port = port_base + 5
-            if dp_rank is None:
-                # TokenizerManager to DataParallelController
-                scheduler_input_port = port_base + 4
-            else:
+            if port_plan is None:
+                detokenizer_port = tokenizer_port + 1
+                rpc_port = tokenizer_port + 2
+                metrics_port = tokenizer_port + 3
+                load_collector_port = tokenizer_port + 5
+                if dp_rank is None:
+                    # TokenizerManager to DataParallelController
+                    scheduler_input_port = tokenizer_port + 4
+            if dp_rank is not None:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
@@ -9500,10 +9613,13 @@ class PortArgs:
                 envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
             )
             try:
-                if dp_rank is None:
+                check_shared_ports = dp_rank is None and (
+                    port_plan is None or server_args.node_rank == 0
+                )
+                if check_shared_ports:
                     if not (is_joiner or dist_init_overridden):
                         wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
+                    wait_port_available(tokenizer_port, "tokenizer_port")
                     wait_port_available(detokenizer_port, "detokenizer_port")
                     if not dist_init_overridden:
                         wait_port_available(nccl_port, "nccl_port")
@@ -9511,18 +9627,26 @@ class PortArgs:
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
+                    if port_plan is not None:
+                        wait_port_available(
+                            port_plan["handshake"], "dp_attention_handshake_port"
+                        )
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                if check_shared_ports or (dp_rank is not None and worker_ports is None):
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
-                    f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
+                    "Port is already in use. "
+                    f"{dist_init_port=} {tokenizer_port=} {detokenizer_port=} "
+                    f"{nccl_port=} {scheduler_input_port=}"
                 )
                 raise
 
             return PortArgs(
-                tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
+                tokenizer_ipc_name=NetworkAddress(
+                    dist_init_host, tokenizer_port
+                ).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),

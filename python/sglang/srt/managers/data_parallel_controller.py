@@ -49,9 +49,10 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import (
-    DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
     ServerArgs,
+    get_dp_attention_handshake_address,
+    get_dp_attention_port_plan,
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
@@ -438,16 +439,7 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
-        is_joiner = server_args.is_ep_scale_joiner
-        if server_args.dist_init_addr is None or is_joiner:
-            na = NetworkAddress(
-                server_args.host or "127.0.0.1",
-                server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
-            )
-        else:
-            na = NetworkAddress.parse(server_args.dist_init_addr)
-            na = NetworkAddress(na.host, na.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA)
-        endpoint = na.to_tcp()
+        endpoint = get_dp_attention_handshake_address(server_args).to_tcp()
 
         if server_args.node_rank == 0:
             # Node 0: Broadcast worker ports to all other nodes
@@ -552,9 +544,8 @@ class DataParallelController:
         worker_ports = []
         if server_args.is_ep_scale_joiner:
             # Scale joiners connect to their pre-bound primary worker sockets.
-            primary = NetworkAddress.parse(server_args.dist_init_addr)
-            primary_endpoint = NetworkAddress(
-                primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+            primary_endpoint = get_dp_attention_handshake_address(
+                server_args
             ).to_tcp()
             all_ports = self._receive_ports_as_client(
                 primary_endpoint, server_args.node_rank
@@ -644,7 +635,10 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if server_args.is_ep_scale_joiner:
+                    if (
+                        server_args.is_ep_scale_joiner
+                        and get_dp_attention_port_plan(server_args) is None
+                    ):
                         # Scale-joiner outputs return through the primary tokenizer.
                         primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
                         primary_port_base = primary_addr.port + 1
