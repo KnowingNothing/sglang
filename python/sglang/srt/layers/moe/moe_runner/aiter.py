@@ -167,9 +167,28 @@ class AiterRunnerCore(MoeRunnerCore):
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
         if self.config.activation == "situ":
+            from aiter import dtypes as aiter_dtypes
             from aiter.ops.flydsl.moe_common import GateMode
 
-            extra["gate_mode"] = GateMode.SEPARATED.value
+            from sglang.srt.runtime_context import get_server_args
+
+            compute_dtype = get_server_args().mxfp4_moe_compute_dtype
+
+            # The native K3 A8W4 path prepares w13 with
+            # shuffle_weight_a16w4(..., gate_up=True), so the runtime epilogue
+            # must consume the matching gate/up-interleaved layout.  Other
+            # SiTU paths retain the historical separated layout.
+            extra["gate_mode"] = (
+                GateMode.INTERLEAVE.value
+                if compute_dtype == "fp8"
+                else GateMode.SEPARATED.value
+            )
+            if compute_dtype != "auto":
+                extra["q_dtype_a"] = (
+                    aiter_dtypes.fp8
+                    if compute_dtype == "fp8"
+                    else aiter_dtypes.bf16
+                )
             if self.config.gemm1_alpha is not None:
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
@@ -353,10 +372,16 @@ def _pre_permute_deepep_to_aiter(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )
             a1_scale = None
-        elif is_w4a4 and is_fp4_dispatch and a1_scale is not None and swiglu_interleave:
-            # W4A4 weights + FP4 dispatch on the clamped-SwiGLU/INTERLEAVE
-            # path: AITER expects a bf16/fp8 activation here, not fp4x2.
-            # Dequant FP4->BF16 and let fused_moe re-quantize internally.
+        elif (
+            is_w4a4
+            and is_fp4_dispatch
+            and a1_scale is not None
+            and (swiglu_interleave or runner_config.activation == "situ")
+        ):
+            # Keep the MORI payload in FP4, then restore BF16 at the compute
+            # boundary. AITER will quantize this tensor to the command-line
+            # selected SiTU operand (FP8 for --mxfp4-moe-compute-dtype=fp8,
+            # BF16 for =bf16). The expert weights themselves stay packed MXFP4.
             hidden_states = upscale_mxfp4(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )

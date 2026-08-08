@@ -97,7 +97,10 @@ def _get_deepep_comm_group(a2a_backend):
     group = get_tp_group().device_group
 
     if a2a_backend.is_mori():
-        group = get_tp_group()
+        # This equals TP when EP==TP, but becomes the correct strict subgroup
+        # when the outer TP envelope contains multiple expert replicas (for
+        # example outer TP32 / MoE-DP2 / EP16).
+        group = get_moe_ep_group()
 
     elif _is_npu:
         group = get_moe_ep_group().device_group

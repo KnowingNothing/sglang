@@ -7,9 +7,9 @@ import torch
 
 _UTILS_PATH = (
     Path(__file__).resolve().parents[5]
-    / "python/sglang/srt/layers/moe/moe_runner/triton_mori_utils.py"
+    / "python/sglang/srt/layers/moe/moe_runner/mori_runner_utils.py"
 )
-_SPEC = importlib.util.spec_from_file_location("triton_mori_utils", _UTILS_PATH)
+_SPEC = importlib.util.spec_from_file_location("mori_runner_utils", _UTILS_PATH)
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 compact_mori_routes = _MODULE.compact_mori_routes

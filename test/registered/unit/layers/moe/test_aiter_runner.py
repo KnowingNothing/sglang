@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterQuantType,
     AiterRunnerCore,
     AiterRunnerInput,
+    _pre_permute_deepep_to_aiter,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -40,8 +41,9 @@ def _quant_info(**overrides):
 def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter = ModuleType("aiter")
     fake_aiter.__path__ = []
-    fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
+    fake_aiter.ActivationType = SimpleNamespace(Silu="Silu", Situv2="Situv2")
     fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
+    fake_aiter.dtypes = SimpleNamespace(fp8="fp8", bf16="bf16")
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
@@ -52,7 +54,8 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_flydsl.__path__ = []
     fake_moe_common = ModuleType("aiter.ops.flydsl.moe_common")
     fake_moe_common.GateMode = SimpleNamespace(
-        INTERLEAVE=SimpleNamespace(value="INTERLEAVE")
+        INTERLEAVE=SimpleNamespace(value="interleave"),
+        SEPARATED=SimpleNamespace(value="separated"),
     )
 
     monkeypatch.setitem(sys.modules, "aiter", fake_aiter)
@@ -113,6 +116,90 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+def test_mori_fp4_situ_restores_bf16_before_selected_mxfp4_compute(monkeypatch):
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is None:
+        pytest.skip("torch build does not expose packed FP4")
+
+    hidden_states = torch.empty((2, 2), dtype=fp4_dtype)
+    hidden_states_scale = torch.ones((2, 1), dtype=torch.uint8)
+    num_local_tokens = torch.tensor([2], dtype=torch.int32)
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+    topk_weights = torch.ones((2, 1), dtype=torch.float32)
+    dispatch_output = SimpleNamespace(
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        num_recv_tokens_per_expert=num_local_tokens,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        origin_topk_ids=topk_ids,
+        origin_topk_weights=topk_weights,
+        out_dtype=torch.bfloat16,
+    )
+
+    from sglang.kernels.ops.moe import rocm_moe_utils
+
+    calls = []
+
+    def fake_upscale_mxfp4(hidden, scale, rows, output_dtype):
+        calls.append((hidden, scale, rows, output_dtype))
+        return torch.zeros((2, 4), dtype=output_dtype)
+
+    monkeypatch.setattr(rocm_moe_utils, "upscale_mxfp4", fake_upscale_mxfp4)
+    runner_input = _pre_permute_deepep_to_aiter(
+        dispatch_output,
+        _quant_info(),
+        MoeRunnerConfig(activation="situ", num_local_experts=1),
+        running_state={},
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] is hidden_states
+    assert calls[0][1] is hidden_states_scale
+    assert calls[0][2] is num_local_tokens
+    assert calls[0][3] is torch.bfloat16
+    assert runner_input.hidden_states.dtype is torch.bfloat16
+    assert runner_input.a1_scale is None
+    assert runner_input.quant_type is AiterQuantType.PER_1X32
+    assert runner_input.num_local_tokens is num_local_tokens
+
+
+@pytest.mark.parametrize(
+    ("compute_dtype", "expected_gate_mode", "expected_q_dtype_a"),
+    [("fp8", "interleave", "fp8"), ("bf16", "separated", "bf16")],
+)
+def test_situ_gate_mode_matches_selected_mxfp4_weight_layout(
+    monkeypatch, compute_dtype, expected_gate_mode, expected_q_dtype_a
+):
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_server_args",
+        lambda: SimpleNamespace(mxfp4_moe_compute_dtype=compute_dtype),
+    )
+
+    captured = {}
+
+    def fake_fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fake_fused_moe)
+
+    core = AiterRunnerCore(
+        MoeRunnerConfig(activation="situ", num_local_experts=1)
+    )
+    hidden_states = torch.zeros((1, 4), dtype=torch.bfloat16)
+    runner_input = AiterRunnerInput(
+        hidden_states=hidden_states,
+        topk_ids=torch.zeros((1, 1), dtype=torch.int32),
+        topk_weights=torch.ones((1, 1), dtype=torch.float32),
+        quant_type=AiterQuantType.PER_1X32,
+    )
+
+    core.run(runner_input, _quant_info(), running_state={})
+    assert captured["gate_mode"] == expected_gate_mode
+    assert captured["q_dtype_a"] == expected_q_dtype_a
 
 
 if __name__ == "__main__":

@@ -212,6 +212,26 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     }
 
 
+def _get_mori_gpu_per_node(group) -> int:
+    """Return how many ranks from ``group`` share this rank's node."""
+    local_world_size = group.local_size or get_int_env_var(
+        "LOCAL_WORLD_SIZE", torch.cuda.device_count()
+    )
+    if local_world_size <= 0:
+        return min(group.world_size, 8)
+
+    node_index = group.rank // local_world_size
+    gpu_per_node = sum(
+        global_rank // local_world_size == node_index for global_rank in group.ranks
+    )
+    if gpu_per_node <= 0:
+        raise RuntimeError(
+            "MORI process group does not contain the current rank's node: "
+            f"rank={group.rank}, ranks={group.ranks}, local_world_size={local_world_size}"
+        )
+    return gpu_per_node
+
+
 # init_mori_op only needs do once in model initial stage
 # use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
 @lru_cache(maxsize=4)
@@ -236,7 +256,11 @@ def init_mori_op(
     world_size = get_parallel().moe_ep_size
     rank = get_parallel().moe_ep_rank
 
-    gpu_per_node = 8 if world_size >= 8 else world_size
+    # Count this EP group's ranks on the current physical node rather than
+    # assuming every EP subgroup always occupies min(world_size, 8) local
+    # devices. This remains 8 for outer TP32 / MoE-DP2 / EP16 laid out as two
+    # complete nodes per expert replica, and is correct for other rank layouts.
+    gpu_per_node = _get_mori_gpu_per_node(group)
 
     group_name = f"mori"
     cpu_group = group.cpu_group
@@ -311,7 +335,7 @@ def init_mori_op(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
         f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
         f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} "
-        f"{use_external_inp_buf=} "
+        f"{use_external_inp_buf=} {gpu_per_node=} "
     )
 
     def check_mori_compatibility(kwargs: dict) -> None:

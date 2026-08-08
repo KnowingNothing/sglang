@@ -1852,13 +1852,33 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="deepep", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="deepep", tp_size=8, ep_size=1)
+                )
             ),
             {"ep_size": 8},
         )
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="mori", tp_size=32, ep_size=16)
+                )
+            ),
+            {},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="mori", tp_size=32, ep_size=1)
+                )
+            ),
+            {"ep_size": 32},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(
+                    SimpleNamespace(moe_a2a_backend="none", tp_size=8, ep_size=1)
+                )
             ),
             {},
         )

@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.moe_runner.triton_mori_utils import (
+from sglang.srt.layers.moe.moe_runner.mori_runner_utils import (
     compact_mori_routes,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend

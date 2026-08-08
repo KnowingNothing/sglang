@@ -798,6 +798,19 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    dp_local_chunked_prefill_size: A[
+        Optional[int],
+        Arg(
+            help=(
+                "The actual chunked-prefill token limit on each attention-DP "
+                "rank. This is mutually exclusive with --chunked-prefill-size. "
+                "SGLang derives the internal global envelope by multiplying this "
+                "value by the attention data-parallel size."
+            ),
+            aliases=["--per-dp-chunked-prefill-size"],
+        ),
+        NS("schedule"),
+    ] = None
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -1000,8 +1013,13 @@ class ServerArgs:
     tp_size: A[
         int,
         Arg(
-            help="The tensor parallelism size.",
-            aliases=["--tensor-parallel-size"],
+            help=(
+                "The total model-parallel world size within one pipeline stage. "
+                "With DP/CP attention this is not the effective attention tensor-"
+                "parallel size. Prefer --model-parallel-size and pass "
+                "--attention-tensor-parallel-size to assert the effective topology."
+            ),
+            aliases=["--tensor-parallel-size", "--model-parallel-size"],
         ),
         NS("parallel"),
     ] = 1
@@ -1032,11 +1050,28 @@ class ServerArgs:
     dp_size: A[
         int,
         Arg(
-            help="The data parallelism size.",
-            aliases=["--data-parallel-size"],
+            help=(
+                "The attention data-parallel size. Under --enable-dp-attention, "
+                "effective attention TP is model_parallel_size / dp_size / "
+                "attention_context_parallel_size."
+            ),
+            aliases=["--data-parallel-size", "--attention-data-parallel-size"],
         ),
         NS("parallel"),
     ] = 1
+    attention_tp_size: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Assert the effective attention tensor-parallel size. This is "
+                "a topology contract, not an independent dimension: it must equal "
+                "model_parallel_size / attention_data_parallel_size / "
+                "attention_context_parallel_size."
+            ),
+            aliases=["--attention-tensor-parallel-size"],
+        ),
+        NS("parallel"),
+    ] = None
     load_balance_method: A[
         str,
         Arg(
@@ -1068,6 +1103,19 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    moe_tp_size: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Assert the effective MoE tensor-parallel size. This is a "
+                "topology contract, not an independent dimension: it must equal "
+                "model_parallel_size / expert_parallel_size / "
+                "moe_data_parallel_size."
+            ),
+            aliases=["--moe-tensor-parallel-size"],
+        ),
+        NS("parallel"),
+    ] = None
     dcp_comm_backend: A[
         str,
         Arg(
@@ -2310,6 +2358,21 @@ class ServerArgs:
         "Choose the computation precision of flashinfer mxfp4 moe",
         NS("exec.moe"),
     ] = "default"
+    mxfp4_moe_compute_dtype: A[
+        Literal["auto", "bf16", "fp8"],
+        Arg(
+            help=(
+                "Compute operand dtype for native MXFP4 routed-expert weights. "
+                "The weights remain packed MXFP4 in HBM. 'fp8' selects an A8W4 "
+                "path that converts only the active weight tile to FP8 registers "
+                "during computation; it must not "
+                "be confused with SGLANG_MXFP4_DEQUANT_TO_FP8, which expands and "
+                "stores the complete weights as FP8."
+            ),
+            choices=["auto", "bf16", "fp8"],
+        ),
+        NS("exec.moe"),
+    ] = "auto"
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
@@ -3474,6 +3537,10 @@ class ServerArgs:
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
 
+        # Convert an explicit per-DP chunk contract into the historical global
+        # envelope before memory and CUDA-graph defaults consume it.
+        self._handle_dp_local_chunked_prefill_size()
+
         # Set missing default values.
         self._handle_missing_default_values()
 
@@ -3564,6 +3631,8 @@ class ServerArgs:
         # Handle MoE configurations.
         self._handle_moe_kernel_config()
         self._handle_a2a_moe()
+        self._handle_explicit_parallel_topology()
+        self._handle_mxfp4_moe_compute_dtype()
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
@@ -3947,6 +4016,30 @@ class ServerArgs:
             self.prefill_delayer_max_delay_passes = x
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
             self.prefill_delayer_token_usage_low_watermark = x
+
+    def _handle_dp_local_chunked_prefill_size(self):
+        local_size = self.dp_local_chunked_prefill_size
+        if local_size is None:
+            return
+        if self.chunked_prefill_size is not None:
+            raise ValueError(
+                "--per-dp-chunked-prefill-size and --chunked-prefill-size are "
+                "mutually exclusive. State the actual per-DP behavior only once."
+            )
+        if local_size <= 0:
+            raise ValueError(
+                "--per-dp-chunked-prefill-size must be a positive integer; "
+                f"got {local_size}."
+            )
+
+        self.chunked_prefill_size = local_size * self.dp_size
+        logger.warning(
+            "Per-DP chunked prefill contract: local=%d, attention_dp=%d, "
+            "internal_global_envelope=%d.",
+            local_size,
+            self.dp_size,
+            self.chunked_prefill_size,
+        )
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
@@ -6232,13 +6325,117 @@ class ServerArgs:
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
         if view.attn_cp_size != self.moe_dp_size:
-            assert (
-                self.moe_dp_size == 1
-            ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+            independent_mori_dp = (
+                view.enable_dp_attention
+                and view.attn_cp_size == 1
+                and view.moe_a2a_backend == "mori"
+            )
+            assert self.moe_dp_size == 1 or independent_mori_dp, (
+                "attn_cp_size != moe_dp_size is only supported when "
+                "moe_dp_size == 1, except MORI expert replicas under "
+                "DP attention with attn_cp_size == 1"
+            )
 
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _handle_explicit_parallel_topology(self):
+        """Validate optional effective-dimension assertions from the CLI.
+
+        Historically ``tp_size`` is the complete model-parallel envelope, even
+        when DP/CP split attention into a smaller tensor-parallel group.  The
+        explicit assertions keep the launch command and the process groups from
+        describing different topologies.
+        """
+        view = self._resolved()
+
+        attn_denominator = self.dp_size * view.attn_cp_size
+        if self.tp_size % attn_denominator != 0:
+            raise ValueError(
+                "--model-parallel-size must be divisible by "
+                "--attention-data-parallel-size * "
+                "--attention-context-parallel-size; got "
+                f"{self.tp_size} % ({self.dp_size} * {view.attn_cp_size})."
+            )
+        effective_attention_tp = self.tp_size // attn_denominator
+
+        moe_denominator = view.ep_size * self.moe_dp_size
+        if self.tp_size % moe_denominator != 0:
+            raise ValueError(
+                "--model-parallel-size must be divisible by "
+                "--expert-parallel-size * --moe-data-parallel-size; got "
+                f"{self.tp_size} % ({view.ep_size} * {self.moe_dp_size})."
+            )
+        effective_moe_tp = self.tp_size // moe_denominator
+
+        if (
+            self.attention_tp_size is not None
+            and self.attention_tp_size != effective_attention_tp
+        ):
+            raise ValueError(
+                "--attention-tensor-parallel-size does not match the resolved "
+                "topology: requested "
+                f"{self.attention_tp_size}, resolved {effective_attention_tp} "
+                f"from model_parallel={self.tp_size}, attention_dp={self.dp_size}, "
+                f"attention_cp={view.attn_cp_size}."
+            )
+        if self.moe_tp_size is not None and self.moe_tp_size != effective_moe_tp:
+            raise ValueError(
+                "--moe-tensor-parallel-size does not match the resolved topology: "
+                f"requested {self.moe_tp_size}, resolved {effective_moe_tp} from "
+                f"model_parallel={self.tp_size}, expert_parallel={view.ep_size}, "
+                f"moe_dp={self.moe_dp_size}."
+            )
+
+        logger.warning(
+            "Resolved parallel topology: model_parallel=%d, pipeline_parallel=%d, "
+            "attention_dp=%d, attention_tp=%d, attention_cp=%d, moe_dp=%d, "
+            "expert_parallel=%d, moe_tp=%d.",
+            self.tp_size,
+            self.pp_size,
+            self.dp_size,
+            effective_attention_tp,
+            view.attn_cp_size,
+            self.moe_dp_size,
+            view.ep_size,
+            effective_moe_tp,
+        )
+
+    def _handle_mxfp4_moe_compute_dtype(self):
+        """Make native MXFP4 compute precision an explicit serving contract."""
+        compute_dtype = self.mxfp4_moe_compute_dtype
+        if compute_dtype == "auto":
+            return
+
+        view = self._resolved()
+        if view.moe_runner_backend != "aiter":
+            raise ValueError(
+                "--mxfp4-moe-compute-dtype currently requires "
+                "--moe-runner-backend aiter; got "
+                f"{view.moe_runner_backend!r}."
+            )
+        if envs.SGLANG_MXFP4_DEQUANT_TO_FP8.get():
+            raise ValueError(
+                "--mxfp4-moe-compute-dtype keeps weights stored as MXFP4 and is "
+                "incompatible with SGLANG_MXFP4_DEQUANT_TO_FP8=1, which expands "
+                "the full checkpoint weights to FP8."
+            )
+
+        legacy = os.environ.get("AITER_SITUV2_A8W4")
+        if legacy is not None:
+            raise ValueError(
+                "AITER_SITUV2_A8W4 must be unset when "
+                f"--mxfp4-moe-compute-dtype={compute_dtype} is explicit. "
+                "The command line is forwarded directly to AITER as q_dtype_a; "
+                "there must not be a second environment-variable control path."
+            )
+        logger.warning(
+            "Native MXFP4 MoE weights remain packed in HBM; backend=%s, "
+            "compute dtype=%s.",
+            view.moe_runner_backend,
+            compute_dtype,
+        )
 
     def _handle_dwdp(self):
         if self.dwdp_size <= 1:
@@ -6609,7 +6806,8 @@ class ServerArgs:
                 self.deepep_mode = "normal"
                 logger.warning("auto set deepep_mode=`normal` for MORI EP")
             logger.warning(
-                f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                "MoRI MoE is enabled with "
+                f"ep_size={resolved_view(self).ep_size}, tp_size={self.tp_size}."
             )
 
             # Check chunked prefill for mori

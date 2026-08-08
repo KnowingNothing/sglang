@@ -2293,7 +2293,7 @@ def _cutlass_moe_env_override(view: Any) -> dict:
 
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
-    {"megamoe", "deepep", "mooncake", "nixl", "ascend_fuseep", "flashinfer", "mori"}
+    {"megamoe", "deepep", "mooncake", "nixl", "ascend_fuseep", "flashinfer"}
 )
 
 
@@ -2321,6 +2321,12 @@ def _a2a_backend_overrides(view: Any) -> dict:
 @register_post_process
 def _a2a_ep_size(view: Any) -> dict:
     if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
+        return {"ep_size": view.tp_size}
+    if view.moe_a2a_backend == "mori" and view.ep_size == 1:
+        # Preserve MORI's historical zero-config behavior, while allowing an
+        # explicit EP subgroup (for example outer TP32 / MoE-DP2 / EP16).
+        # MORI uses the dedicated MoE-EP process group and does not inherently
+        # require EP to span the complete outer TP group.
         return {"ep_size": view.tp_size}
     return {}
 

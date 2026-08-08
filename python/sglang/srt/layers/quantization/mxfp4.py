@@ -822,6 +822,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             return
+
         if _use_aiter:
             if getattr(layer, "w13_weight_bias", None) is not None:
                 layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(
@@ -858,7 +859,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
 
             k3_situ_a8w4 = (
-                os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
+                get_server_args().mxfp4_moe_compute_dtype == "fp8"
                 and getattr(layer.moe_runner_config, "activation", None) == "situ"
             )
             use_aiter_gu_interleave = k3_situ_a8w4 or (
