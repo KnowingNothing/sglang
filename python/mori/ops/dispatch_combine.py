@@ -246,25 +246,23 @@ def _load_hip_modules(kernel_type):
     return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=True)
 
 
-def _barrier_on_current_device():
-    """Synchronize distributed JIT completion on this process's local GPU.
+def _prepare_jit_kernels(kernel_type):
+    """Compile this process's kernel without a distributed synchronization.
 
-    PyTorch otherwise guesses the barrier device from the global rank.  In a
-    multi-node one-process-per-GPU job, global ranks on later nodes are larger
-    than the node-local device ordinals and can make the RCCL barrier launch on
-    an invalid HIP device.  The caller has already selected its local device,
-    so pass that device explicitly.
+    ``compile_genco`` already serializes processes that share a node-local JIT
+    cache with ``FileBaton``.  Different nodes have independent cache files, so
+    a WORLD barrier adds no build-safety guarantee.  It is also incorrect for
+    lazy operator construction: independent DP/EP replicas can first enter the
+    operator at different times, and a global device collective can fail or
+    deadlock despite the local JIT artifact already being ready.
     """
-    if dist.is_initialized():
-        dist.barrier(device_ids=[torch.cuda.current_device()])
+    _ensure_jit_kernels(kernel_type)
 
 
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
-        _ensure_jit_kernels(config.kernel_type)
-
-        _barrier_on_current_device()
+        _prepare_jit_kernels(config.kernel_type)
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         self._cpp_config = mori_cpp.EpDispatchCombineConfig(
