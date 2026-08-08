@@ -1247,6 +1247,13 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
                 ", num_expert_group=",
                 num_expert_group);
 
+    // Empty token batches are valid for data-parallel idle forwards.  HIP does
+    // not permit launching a kernel with grid.x == 0, and the resulting launch
+    // error may otherwise be reported asynchronously by an unrelated later
+    // allocation.
+    if(num_tokens == 0)
+        return;
+
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
@@ -1296,6 +1303,9 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
                 topk_grp,
                 ", num_expert_group=",
                 num_expert_group);
+
+    if(num_tokens == 0)
+        return;
 
     // TODO: expand usage in the future
     bool use_opt_sort = false;

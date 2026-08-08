@@ -172,6 +172,12 @@ def biased_grouped_topk(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
     token_num = gating_output.shape[0]
+    # DP-attention executes an idle forward on ranks that receive no tokens.
+    # Do not enter the JIT/AOT kernel path for that valid empty batch: the HIP
+    # launcher uses one block per token, and a zero-token batch would otherwise
+    # produce an invalid grid.x=0 launch.
+    if token_num == 0:
+        return None
     num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
     if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
