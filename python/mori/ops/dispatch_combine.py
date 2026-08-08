@@ -246,13 +246,25 @@ def _load_hip_modules(kernel_type):
     return load_hip_module(_KERNEL_TYPE_TO_HIP[kernel_type], init_shmem=True)
 
 
+def _barrier_on_current_device():
+    """Synchronize distributed JIT completion on this process's local GPU.
+
+    PyTorch otherwise guesses the barrier device from the global rank.  In a
+    multi-node one-process-per-GPU job, global ranks on later nodes are larger
+    than the node-local device ordinals and can make the RCCL barrier launch on
+    an invalid HIP device.  The caller has already selected its local device,
+    so pass that device explicitly.
+    """
+    if dist.is_initialized():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+
+
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
         _ensure_jit_kernels(config.kernel_type)
 
-        if dist.is_initialized():
-            dist.barrier()
+        _barrier_on_current_device()
 
         handle_class = _cpp_dispatch_combine_factory("EpDispatchCombineHandle")
         self._cpp_config = mori_cpp.EpDispatchCombineConfig(
