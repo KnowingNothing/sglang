@@ -110,13 +110,14 @@ def shmem_torch_process_group_init(group_name: str):
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
 
-    if rank == 0:
-        uid = shmem_get_unique_id()
-        dist.broadcast_object_list([uid], src=0, group=group)
-    else:
-        uid_list = [None]
-        dist.broadcast_object_list(uid_list, src=0, group=group)
-        uid = uid_list[0]
+    # ``src`` is a global rank even when ``group`` is a subgroup.  Using the
+    # world root (global rank 0) only works for subgroups that happen to
+    # contain it.  Resolve group-local rank 0 back to its global rank so each
+    # independent subgroup can bootstrap its own symmetric heap.
+    group_src = dist.get_global_rank(group, 0)
+    uid_list = [shmem_get_unique_id() if rank == 0 else None]
+    dist.broadcast_object_list(uid_list, src=group_src, group=group)
+    uid = uid_list[0]
 
     return shmem_init_attr(MORI_SHMEM_INIT_WITH_UNIQUEID, rank, world_size, uid)
 

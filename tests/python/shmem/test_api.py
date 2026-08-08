@@ -21,6 +21,7 @@
 # SOFTWARE.
 import pytest
 import mori.shmem as shmem
+import mori.shmem.api as shmem_api
 from tests.python.utils import TorchDistContext, get_free_port
 import torch
 
@@ -210,3 +211,57 @@ def test_uniqueid_init(world_size):
         nprocs=world_size,
         join=True,
     )
+
+
+def test_torch_process_group_init_uses_group_global_root(monkeypatch):
+    """A subgroup rooted at global rank 16 must not broadcast from rank 0."""
+    group = object()
+    unique_id = b"m" * 128
+    local_rank = {"value": 0}
+    broadcasts = []
+    init_calls = []
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d,
+        "_resolve_process_group",
+        lambda name: group,
+    )
+    monkeypatch.setattr(
+        torch.distributed, "get_rank", lambda process_group: local_rank["value"]
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda process_group: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_global_rank",
+        lambda process_group, group_rank: 16 + group_rank,
+    )
+
+    def broadcast_object_list(values, src, group):
+        broadcasts.append((src, group))
+        if values[0] is None:
+            values[0] = unique_id
+
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", broadcast_object_list
+    )
+    monkeypatch.setattr(shmem_api, "_ensure_shmem_module", lambda: None)
+    monkeypatch.setattr(shmem_api, "shmem_get_unique_id", lambda: unique_id)
+    monkeypatch.setattr(
+        shmem_api,
+        "shmem_init_attr",
+        lambda flags, rank, world_size, uid: init_calls.append(
+            (flags, rank, world_size, uid)
+        )
+        or 0,
+    )
+
+    for rank in (0, 1):
+        local_rank["value"] = rank
+        assert shmem_api.shmem_torch_process_group_init("mori") == 0
+
+    assert broadcasts == [(16, group), (16, group)]
+    assert [call[1:] for call in init_calls] == [
+        (0, 2, unique_id),
+        (1, 2, unique_id),
+    ]
