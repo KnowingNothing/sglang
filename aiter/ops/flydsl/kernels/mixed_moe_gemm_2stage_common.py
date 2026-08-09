@@ -5949,6 +5949,21 @@ def compile_mixed_moe_gemm1_a16w4(
         if _need_quant:
             _use_cshuffle_epilog = True
 
+    # AITER's sorter exposes a static-capacity M-block list, while the actual
+    # live prefix is only available through the device-side num_valid_ids
+    # scalar.  For large-capacity serving shapes, use a CU-sized physical grid
+    # and let each workgroup consume only its share of the live M tiles.  This
+    # avoids both HIP's 65,535 grid.y limit and tens of thousands of empty
+    # workgroups for one-token decode/idle batches.
+    _persistent = persist_m <= 0
+    if _persistent:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        _cu_num = get_cu_num()
+    else:
+        persist_m = max(int(persist_m), 1)
+        _cu_num = 0
+
     # ---- module_name (different format per path; cache key) ----
     if is_a16w4_stage1:
         _mode_tag = "gui" if gate_up_interleave else ("go" if gate_only else "sep")
@@ -5956,11 +5971,11 @@ def compile_mixed_moe_gemm1_a16w4(
         _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
         _ski_tag = f"_ski{_k_batch}" if _k_batch > 1 else ""
         _bias_tag = "_bias" if enable_bias else ""
-        # persist_m changes both the physical grid and the kernel's logical
-        # M-block traversal.  Keep it in the on-disk module name as well as the
-        # Python cache key so a non-persistent binary can never alias a
-        # persistent one.
-        _persist_tag = f"_pm{persist_m}"
+        # The scheduling mode changes both the physical grid and logical
+        # M-block traversal, so it must be part of the on-disk cache key.
+        _persist_tag = (
+            f"_persist_cu{_cu_num}" if _persistent else f"_pm{persist_m}"
+        )
         _act_tag = f"_{act}" if act != "silu" else ""
         if act == "situv2":
             # distinct binary per beta so a different beta never aliases
@@ -6261,29 +6276,47 @@ def compile_mixed_moe_gemm1_a16w4(
             by = gpu.block_id("x")
             bx_persist = gpu.block_id("y")
 
-            # AITER's sorter exposes a static-capacity list to the fused MoE
-            # kernel.  With K3 EP16 that list has 131,967 M blocks, which is
-            # larger than HIP's 65,535 grid.y limit even when only a few rows
-            # are valid.  Match the generic mixed-MoE path: reduce physical
-            # grid.y by persist_m and visit the original logical blocks in a
-            # fixed order inside each workgroup.  All arithmetic and output
-            # indices below still use the original logical bx.
-            c0_p = arith.constant(0, index=True)
-            c1_p = arith.constant(1, index=True)
-            c_pm = arith.constant(persist_m, index=True)
-            for_persist = scf.ForOp(c0_p, c_pm, c1_p)
-            for_ip = ir.InsertionPoint(for_persist.body)
-            for_ip.__enter__()
-            mi_p = for_persist.induction_variable
-            bx = bx_persist * c_pm + mi_p
-
-            bx_m = bx * arith.index(tile_m)
             numids_rsrc = ptr_buffer_resource(
                 arg_num_valid_ids, arith.constant(4, type=i32)
             )
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=i32
             )
+            num_valid_i32 = rocdl.ReadfirstlaneOp(i32, num_valid_i32).res
+
+            c0_p = arith.constant(0, index=True)
+            c1_p = arith.constant(1, index=True)
+            if const_expr(_persistent):
+                c_cu = arith.constant(_cu_num, index=True)
+                c_tm = arith.constant(tile_m, index=True)
+                num_valid_idx = arith.index_cast(T.index, num_valid_i32)
+                total_m_tiles = (num_valid_idx + c_tm - c1_p) // c_tm
+                tiles_per_block_base = total_m_tiles // c_cu
+                tiles_remainder = total_m_tiles - (tiles_per_block_base * c_cu)
+                has_extra_tile = arith.cmpi(
+                    arith.CmpIPredicate.ult, bx_persist, tiles_remainder
+                )
+                extra_tile = arith.select(has_extra_tile, c1_p, c0_p)
+                tiles_per_block = tiles_per_block_base + extra_tile
+                start_tail = arith.select(
+                    has_extra_tile, bx_persist, tiles_remainder
+                )
+                persist_start_tile = (
+                    bx_persist * tiles_per_block_base + start_tail
+                )
+                for_persist = scf.ForOp(c0_p, tiles_per_block, c1_p)
+            else:
+                c_pm = arith.constant(persist_m, index=True)
+                for_persist = scf.ForOp(c0_p, c_pm, c1_p)
+            for_ip = ir.InsertionPoint(for_persist.body)
+            for_ip.__enter__()
+            mi_p = for_persist.induction_variable
+            if const_expr(_persistent):
+                bx = persist_start_tile + mi_p
+            else:
+                bx = bx_persist * arith.constant(persist_m, index=True) + mi_p
+
+            bx_m = bx * arith.index(tile_m)
             num_valid_idx = arith.index_cast(T.index, num_valid_i32)  # noqa: F841
             bx_m_i32 = arith.index_cast(i32, bx_m)
             blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
@@ -8150,6 +8183,7 @@ def compile_mixed_moe_gemm1_a16w4(
         inter_dim_pad,
         _use_cshuffle_epilog,
         persist_m,
+        _cu_num,
         use_async_copy,
         waves_per_eu,
         k_batch,
@@ -8229,7 +8263,9 @@ def compile_mixed_moe_gemm1_a16w4(
                 / tile_n_index
                 / arith.constant(2, index=True)
             )
-        if const_expr(is_a16w4_stage1):
+        if const_expr(_persistent):
+            gy = arith.constant(_cu_num, index=True)
+        elif const_expr(is_a16w4_stage1):
             _c_pm_l = arith.constant(persist_m, index=True)
             gy = (
                 arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
@@ -8468,24 +8504,14 @@ def compile_mixed_moe_gemm2_a16w4(
     bias_nbytes = experts * model_dim * 4
 
     # ---- Persist / module name ----
-    if is_a16w4:
-        _persistent = False
-        _cu_num = 0
-        # The public stage2 launcher already raises persist_m when the static
-        # sorted-capacity grid would exceed HIP's 65,535 grid.y limit.  Do not
-        # discard that value here: the legacy loop below supports consecutive
-        # logical M tiles for A8W4/MXFP4 just as it does for the generic path.
-        # Clamp non-positive requests to one to preserve the prior A16W4
-        # behavior for callers that did not resolve a grid limit upstream.
-        persist_m = max(int(persist_m), 1)
-    else:
-        _persistent = persist_m <= 0
-        if _persistent:
-            from aiter.jit.utils.chip_info import get_cu_num
+    _persistent = persist_m <= 0
+    if _persistent:
+        from aiter.jit.utils.chip_info import get_cu_num
 
-            _cu_num = get_cu_num()
-        else:
-            _cu_num = 0
+        _cu_num = get_cu_num()
+    else:
+        persist_m = max(int(persist_m), 1)
+        _cu_num = 0
 
     # Unified module name (cache key). Optional tags are appended only when
     # they deviate from defaults so A8W4/A4W4 keys remain backward-compatible

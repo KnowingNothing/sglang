@@ -1540,7 +1540,10 @@ def _flydsl_moe_stage1_impl(
     )
     _grid_y = min(_dense_blks, _all_blks)
 
-    _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
+    if persist_m < 0 or (persist_m == 0 and _grid_y > 256):
+        _persist_m = -1
+    else:
+        _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
@@ -1989,10 +1992,6 @@ def _flydsl_moe_stage2_impl(
         _persist_m = 4 if m_blocks > 256 else 1
     else:
         _persist_m = -1 if m_blocks > 256 else 1
-
-    if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
-        _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
