@@ -64,6 +64,18 @@ if TYPE_CHECKING:
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
 
+def _get_metadata_batch_capacity(model_runner: ModelRunner) -> int:
+    # Keep this local: common.py participates in model-runner imports, while
+    # attention backends are imported during runner construction.
+    from sglang.srt.utils.common import get_eager_max_batch_size
+
+    pool_size = model_runner.req_to_token_pool.size
+    return max(
+        pool_size,
+        get_eager_max_batch_size(model_runner.server_args, pool_size),
+    )
+
+
 def _mla_decode_kv_splits_cap(
     base_max_kv_splits: int, sm_count: int, max_context_len: int
 ) -> int:
@@ -144,7 +156,14 @@ class TritonAttnBackend(AttentionBackend):
 
         # Parse args
         self.skip_prefill = skip_prefill
-        max_bs = model_runner.req_to_token_pool.size
+        # Eager DP-attention pads decode rows to the attention-TP alignment in
+        # ForwardBatch.prepare_mlp_sync_batch.  The request pool still reflects
+        # the logical per-DP concurrency, so sizing metadata buffers from the
+        # pool alone under-allocates whenever pool_size < attn_tp_size (for
+        # example one live request with TP8 becomes eight physical eager rows).
+        # Match EagerRunner's padded batch capacity so kv/qo/mask indptr buffers
+        # cover the physical rows consumed by the attention backend.
+        max_bs = _get_metadata_batch_capacity(model_runner)
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
