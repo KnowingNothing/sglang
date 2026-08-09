@@ -13,6 +13,10 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     _pre_permute_deepep_to_aiter,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.moriep import (
+    MoriEPLLDispatchOutput,
+    MoriEPNormalDispatchOutput,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-c-test-cpu")
@@ -164,6 +168,55 @@ def test_mori_fp4_situ_restores_bf16_before_selected_mxfp4_compute(monkeypatch):
     assert runner_input.a1_scale is None
     assert runner_input.quant_type is AiterQuantType.PER_1X32
     assert runner_input.num_local_tokens is num_local_tokens
+
+
+def _mori_dispatch_output(cls, *, capacity=8, live_tokens=2):
+    topk_ids = torch.arange(capacity, dtype=torch.int32).view(capacity, 1)
+    topk_weights = torch.arange(capacity, dtype=torch.float32).view(capacity, 1)
+    return cls(
+        hidden_states=torch.arange(
+            capacity * 4, dtype=torch.bfloat16
+        ).view(capacity, 4),
+        hidden_states_scale=None,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        num_recv_tokens_per_expert=torch.tensor([live_tokens], dtype=torch.int32),
+        origin_topk_ids=topk_ids,
+        origin_topk_weights=topk_weights,
+        out_dtype=torch.bfloat16,
+    )
+
+
+def test_mori_normal_aiter_slices_fixed_arena_to_live_prefix():
+    dispatch_output = _mori_dispatch_output(MoriEPNormalDispatchOutput)
+
+    runner_input = _pre_permute_deepep_to_aiter(
+        dispatch_output,
+        _quant_info(),
+        MoeRunnerConfig(activation="situ", num_local_experts=1),
+        running_state={},
+    )
+
+    assert runner_input.hidden_states.shape == (2, 4)
+    assert runner_input.topk_ids.shape == (2, 1)
+    assert runner_input.topk_weights.shape == (2, 1)
+    assert runner_input.num_local_tokens is dispatch_output.num_recv_tokens_per_expert
+
+
+def test_mori_low_latency_aiter_keeps_small_static_arena():
+    dispatch_output = _mori_dispatch_output(MoriEPLLDispatchOutput)
+
+    runner_input = _pre_permute_deepep_to_aiter(
+        dispatch_output,
+        _quant_info(),
+        MoeRunnerConfig(activation="situ", num_local_experts=1),
+        running_state={},
+    )
+
+    assert runner_input.hidden_states.shape == (8, 4)
+    assert runner_input.topk_ids.shape == (8, 1)
+    assert runner_input.topk_weights.shape == (8, 1)
+    assert runner_input.num_local_tokens is dispatch_output.num_recv_tokens_per_expert
 
 
 @pytest.mark.parametrize(

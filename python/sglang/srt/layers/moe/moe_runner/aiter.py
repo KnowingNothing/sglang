@@ -332,10 +332,35 @@ def _pre_permute_deepep_to_aiter(
 
     if is_mori:
         from sglang.kernels.ops.moe.rocm_moe_utils import upscale, upscale_mxfp4
+        from sglang.srt.layers.moe.token_dispatcher.moriep import (
+            MoriEPNormalDispatchOutput,
+        )
 
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
         output_dtype = dispatch_output.out_dtype
+
+        if num_local_tokens.numel() != 1:
+            raise ValueError(
+                "MORI dispatch must provide a one-element total receive count, "
+                f"got shape={tuple(num_local_tokens.shape)}"
+            )
+
+        # Normal mode is the prefill/mixed-batch path. MORI returns a fixed-
+        # capacity receive arena, while AITER sizes intermediate activations
+        # from the tensor shape. Processing the full arena can therefore turn
+        # a small live batch into multi-GiB stage1/stage2 allocations. A single
+        # host read per MoE layer is acceptable on the prefill path and keeps
+        # AITER's numerical path unchanged. Low-latency decode deliberately
+        # retains a fixed, independently small arena so it has no per-layer
+        # host synchronization.
+        if isinstance(dispatch_output, MoriEPNormalDispatchOutput):
+            total_recv = int(num_local_tokens.item())
+            hidden_states = hidden_states[:total_recv]
+            if a1_scale is not None:
+                a1_scale = a1_scale[:total_recv]
+            topk_ids = topk_ids[:total_recv]
+            topk_weights = topk_weights[:total_recv]
 
         # Truncate dispatch tensors to the configured cap; mori combine only
         # reads [0, totalRecvTokenNum), so the truncated result needs no

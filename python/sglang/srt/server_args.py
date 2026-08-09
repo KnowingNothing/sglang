@@ -6816,9 +6816,6 @@ class ServerArgs:
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass, flashinfer_cutedsl or flashinfer_trtllm_routed moe runner backend"
 
         if a2a_backend == "mori":
-            if self.deepep_mode == "auto":
-                self.deepep_mode = "normal"
-                logger.warning("auto set deepep_mode=`normal` for MORI EP")
             logger.warning(
                 "MoRI MoE is enabled with "
                 f"ep_size={resolved_view(self).ep_size}, tp_size={self.tp_size}."

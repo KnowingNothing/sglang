@@ -243,6 +243,7 @@ def init_mori_op(
     hidden_size,
     params_dtype,
     num_max_dispatch_tokens_per_rank,
+    max_total_recv_tokens,
     deepep_mode,
     instance_id=0,
     dispatch_dtype=DispatchDtype.bf16,
@@ -334,6 +335,7 @@ def init_mori_op(
     logger.info(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
         f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
+        f"{max_total_recv_tokens=} "
         f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} "
         f"{use_external_inp_buf=} {gpu_per_node=} "
     )
@@ -364,9 +366,7 @@ def init_mori_op(
         num_experts_per_token=router_topk,
         warp_num_per_block=warp_num_per_block,
         block_num=block_num,
-        max_total_recv_tokens=get_int_env_var(
-            "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
-        ),
+        max_total_recv_tokens=max_total_recv_tokens,
         use_external_inp_buf=use_external_inp_buf,
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
@@ -419,6 +419,7 @@ class _MoriEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        mori_op_mode: DeepEPMode,
         instance_id: int = 0,
     ):
         try:
@@ -433,11 +434,27 @@ class _MoriEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.mori_op_mode = mori_op_mode
         self.instance_id = instance_id
 
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+        normal_max_dispatch_tokens = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
+        normal_max_recv_tokens = get_int_env_var(
+            "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
+        )
+        if self.mori_op_mode == DeepEPMode.LOW_LATENCY:
+            self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+                "SGLANG_MORI_LOW_LATENCY_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
+                normal_max_dispatch_tokens,
+            )
+            self.max_total_recv_tokens = get_int_env_var(
+                "SGLANG_MORI_LOW_LATENCY_PREALLOC_MAX_RECV_TOKENS",
+                normal_max_recv_tokens,
+            )
+        else:
+            self.num_max_dispatch_tokens_per_rank = normal_max_dispatch_tokens
+            self.max_total_recv_tokens = normal_max_recv_tokens
 
         self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
         self.use_external_inp_buf = True
@@ -465,7 +482,8 @@ class _MoriEPDispatcherImplBase:
                 self.hidden_size,
                 self.params_dtype,
                 self.num_max_dispatch_tokens_per_rank,
-                self.deepep_mode,
+                self.max_total_recv_tokens,
+                self.mori_op_mode,
                 self.instance_id,
                 self.dispatch_dtype,
                 self.combine_dtype,
@@ -573,7 +591,7 @@ class _MoriEPDispatcherImplBase:
 
 class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
     def __init__(self, async_finish: bool, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(mori_op_mode=DeepEPMode.NORMAL, **kwargs)
 
         self.async_finish = async_finish
         self.quant_config = {}
@@ -860,7 +878,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
 
 class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(mori_op_mode=DeepEPMode.LOW_LATENCY, **kwargs)
         self.quant_config = {}
         self.fp8_quant_func = get_hip_quant(QuantType.per_1x128)
         self.fp4_quant_func = get_hip_quant(QuantType.per_1x32)
