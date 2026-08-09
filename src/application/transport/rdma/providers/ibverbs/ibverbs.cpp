@@ -22,7 +22,6 @@
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
 #include <hip/hip_runtime_api.h>
-#include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/srq (forward-declared in core)
 
 #include <algorithm>
@@ -36,6 +35,8 @@
 #include <tuple>
 #include <utility>
 
+#include "mori/application/transport/rdma/providers/dv_loader.hpp"
+#include "mori/application/transport/rdma/providers/mlx5/mlx5_dv.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "mori/utils/mori_log.hpp"
@@ -160,6 +161,10 @@ void IBVerbsDeviceContext::PopulateMlx5GpuDirectHandles(
       endpoint.vendorId != RdmaDeviceVendorId::Mellanox) {
     return;
   }
+  if (!Mlx5DvApi::Available()) {
+    throw std::runtime_error(
+        "MORI ibverbs GPU-direct requires libmlx5.so at runtime");
+  }
 
   mlx5dv_qp directQp{};
   mlx5dv_cq directCq{};
@@ -168,7 +173,7 @@ void IBVerbsDeviceContext::PopulateMlx5GpuDirectHandles(
   directObject.qp.out = &directQp;
   directObject.cq.in = endpoint.ibvHandle.cq;
   directObject.cq.out = &directCq;
-  if (mlx5dv_init_obj(&directObject, MLX5DV_OBJ_QP | MLX5DV_OBJ_CQ) != 0) {
+  if (Mlx5DvApi::Instance().init_obj(&directObject, MLX5DV_OBJ_QP | MLX5DV_OBJ_CQ) != 0) {
     throw std::runtime_error("mlx5dv_init_obj(QP|CQ) failed for ibverbs GPU-direct endpoint");
   }
   auto IsPowerOfTwo = [](uint32_t value) {
