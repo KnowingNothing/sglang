@@ -179,8 +179,16 @@ void Context::InitializeTopologyAndTransports() {
   }
   assert(rankInNode < 8);
 
-  // Init rdma context
-  rdmaContext.reset(new RdmaContext(RdmaBackendType::DirectVerbs));
+  // Init RDMA context. The ibverbs option keeps QP/CQ control-plane setup in
+  // the provider while MORI can still expose the mlx5 data-path handles to GPU
+  // kernels when MORI_IBVERBS_GPU_DIRECT=1.
+  RdmaBackendType rdmaBackend = RdmaBackendType::DirectVerbs;
+  if (const char* backend = std::getenv("MORI_RDMA_BACKEND");
+      backend != nullptr && strcmp(backend, "ibverbs") == 0) {
+    rdmaBackend = RdmaBackendType::IBVerbs;
+    MORI_APP_INFO("MORI_RDMA_BACKEND=ibverbs: provider-managed QP/CQ control plane enabled");
+  }
+  rdmaContext.reset(new RdmaContext(rdmaBackend));
   const RdmaDeviceList& devices = rdmaContext->GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 

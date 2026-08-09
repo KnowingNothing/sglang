@@ -744,6 +744,21 @@ inline __device__ void UpdateDbrAndRingDbRecv<ProviderType::MLX5>(void* dbrRecAd
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Completion Queue                                        */
 /* ---------------------------------------------------------------------------------------------- */
+inline __device__ int PollMlx5RegularCqOnce(void* cqAddr, uint32_t cqeNum,
+                                            uint32_t consIdx,
+                                            uint16_t* wqeCounter) {
+  const uint32_t cqeIndex = consIdx & (cqeNum - 1);
+  volatile Mlx5Cqe64* cqe = reinterpret_cast<volatile Mlx5Cqe64*>(
+      reinterpret_cast<uint8_t*>(cqAddr) + cqeIndex * sizeof(Mlx5Cqe64));
+  const uint8_t opOwn = cqe->op_own;
+  const uint8_t opcode = opOwn >> 4;
+  const uint8_t owner = opOwn & MORI_MLX5_CQE_OWNER_MASK;
+  const uint8_t expectedOwner = !!(consIdx & cqeNum);
+  if (opcode == MORI_MLX5_CQE_INVALID || owner != expectedOwner) return -1;
+  if (wqeCounter != nullptr) *wqeCounter = BE16TOH(cqe->wqe_counter);
+  return opcode;
+}
+
 template <>
 inline __device__ int PollCqOnce<ProviderType::MLX5>(void* cqeAddr, uint32_t cqeNum,
                                                      uint32_t consIdx, uint32_t* wqeIdx) {

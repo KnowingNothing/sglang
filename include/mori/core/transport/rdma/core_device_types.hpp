@@ -142,6 +142,7 @@ struct CompletionQueueHandle {
   uint32_t cq_dbpos{0};
   uint32_t cqeNum{0};
   uint32_t cqeSize{0};
+  uint32_t isCollapsed{1};
   uint32_t pollCqLock{0};
   uint64_t cq_dbval{0};
 };

@@ -387,13 +387,97 @@ inline __device__ void Mlx5CollapsedCqDrain(core::WorkQueueHandle& wq,
 }
 
 template <bool DrainToLive = false>
+inline __device__ void Mlx5RegularCqDrainSameEndpoint(
+    core::WorkQueueHandle& wq, core::CompletionQueueHandle& cq,
+    uint64_t endpointActiveMask) {
+  const int endpointLeader = core::GetFirstActiveLaneID(endpointActiveMask);
+  uint32_t target =
+      DrainToLive ? __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
+                  : __hip_atomic_load(&wq.dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  target = __shfl(target, endpointLeader);
+  while (true) {
+    uint32_t done =
+        __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    done = __shfl(done, endpointLeader);
+    if (done >= target) return;
+    if (core::spin_lock_try_acquire_shared(&cq.pollCqLock, endpointActiveMask)) break;
+    if constexpr (!DrainToLive) return;
+  }
+
+  while (true) {
+    uint32_t done =
+        __hip_atomic_load(&wq.doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    done = __shfl(done, endpointLeader);
+    if constexpr (DrainToLive) {
+      target = __hip_atomic_load(&wq.postIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      target = __shfl(target, endpointLeader);
+    }
+    if (done >= target) break;
+
+    if (core::WarpLaneId() == endpointLeader) {
+      const uint32_t cons = cq.consIdx;
+      uint16_t wqeCounter = 0;
+      int opcode = -1;
+      do {
+        opcode = core::PollMlx5RegularCqOnce(cq.cqAddr, cq.cqeNum, cons,
+                                              &wqeCounter);
+        asm volatile("" ::: "memory");
+      } while (opcode < 0);
+      if (opcode == core::MORI_MLX5_CQE_REQ_ERR ||
+          opcode == core::MORI_MLX5_CQE_RESP_ERR) {
+        const uint32_t cqeIndex = cons & (cq.cqeNum - 1);
+        auto* errorCqe = reinterpret_cast<core::Mlx5ErrCqe*>(
+            reinterpret_cast<uint8_t*>(cq.cqAddr) +
+            cqeIndex * sizeof(core::Mlx5Cqe64));
+        MORI_PRINTF("regular mlx5 CQE error: %s\n",
+                    core::WcStatusString(core::Mlx5HandleErrorCqe(errorCqe)));
+        assert(false);
+      } else {
+        cq.consIdx = cons + 1;
+        core::UpdateCqDbrRecord<core::ProviderType::MLX5>(cq, cq.consIdx);
+        const uint16_t completed16 = static_cast<uint16_t>(wqeCounter + 1);
+        const uint16_t delta =
+            static_cast<uint16_t>(completed16 - static_cast<uint16_t>(done));
+        if (delta != 0) {
+          __hip_atomic_fetch_max(&wq.doneIdx, done + delta, __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_AGENT);
+        }
+      }
+    }
+  }
+  __threadfence_system();
+  core::spin_lock_release_shared(&cq.pollCqLock, endpointActiveMask);
+}
+
+template <bool DrainToLive = false>
+inline __device__ void Mlx5RegularCqDrain(core::WorkQueueHandle& wq,
+                                          core::CompletionQueueHandle& cq) {
+  uint64_t remainingMask = core::GetActiveLaneMask();
+  const uint64_t myCqKey = reinterpret_cast<uintptr_t>(cq.cqAddr);
+  const uint64_t myLaneBit = 1ULL << core::WarpLaneId();
+  while (remainingMask != 0) {
+    const int groupLeader = core::GetFirstActiveLaneID(remainingMask);
+    const uint64_t groupCqKey = __shfl(myCqKey, groupLeader);
+    const uint64_t groupMask = __ballot(myCqKey == groupCqKey) & remainingMask;
+    if ((groupMask & myLaneBit) != 0) {
+      Mlx5RegularCqDrainSameEndpoint<DrainToLive>(wq, cq, groupMask);
+    }
+    remainingMask &= ~groupMask;
+  }
+}
+
+template <bool DrainToLive = false>
 inline __device__ void ShmemQuietThreadKernelMlnxImpl(int pe, int qpId) {
   GpuStates* globalGpuStates = GetGlobalGpuStatesPtr();
   ShmemRdmaEndpoint* ep = globalGpuStates->rdmaEndpoints;
   int epIndex = pe * globalGpuStates->numQpPerPe + (qpId % globalGpuStates->numQpPerPe);
   core::WorkQueueHandle& wq = ep[epIndex].wqHandle;
   core::CompletionQueueHandle& cq = ep[epIndex].cqHandle;
-  Mlx5CollapsedCqDrain<DrainToLive>(wq, cq);
+  if (cq.isCollapsed != 0) {
+    Mlx5CollapsedCqDrain<DrainToLive>(wq, cq);
+  } else {
+    Mlx5RegularCqDrain<DrainToLive>(wq, cq);
+  }
 }
 
 // DrainToLive=false (recycle gate, per-QP): snapshot drain. The caller holds its

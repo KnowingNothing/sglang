@@ -22,6 +22,7 @@
 #pragma once
 
 #include <mutex>
+#include <vector>
 
 #include "infiniband/verbs.h"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -40,10 +41,25 @@ class IBVerbsDeviceContext : public RdmaDeviceContext {
   bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept override;
 
  private:
+  struct MappedHostRange {
+    void* hostBase{nullptr};
+    size_t length{0};
+  };
+
+  struct GpuDirectResources {
+    std::vector<MappedHostRange> mappings;
+    void* atomicIbufAddr{nullptr};
+    ibv_mr* atomicIbufMr{nullptr};
+  };
+
+  void PopulateMlx5GpuDirectHandles(RdmaEndpoint&, const RdmaEndpointConfig&);
+  void DestroyGpuDirectResources(uint32_t qpn) noexcept;
+
   mutable std::mutex poolMu;
   std::unordered_map<void*, ibv_cq*> cqPool;
   std::unordered_map<uint32_t, ibv_qp*> qpPool;
   std::vector<ibv_comp_channel*> compChPool;
+  std::unordered_map<uint32_t, GpuDirectResources> gpuDirectResources;
 };
 
 class IBVerbsDevice : public RdmaDevice {

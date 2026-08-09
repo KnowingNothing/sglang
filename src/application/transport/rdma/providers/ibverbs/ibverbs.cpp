@@ -21,18 +21,23 @@
 // SOFTWARE.
 #include "mori/application/transport/rdma/providers/ibverbs/ibverbs.hpp"
 
+#include <hip/hip_runtime_api.h>
+#include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>  // dereferences ibvHandle.qp/cq/srq (forward-declared in core)
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/application/utils/math.hpp"
 #include "mori/utils/mori_log.hpp"
 namespace mori {
 namespace application {
@@ -75,6 +80,11 @@ const char* LinkLayerName(uint8_t linkLayer) {
     default:
       return "unknown";
   }
+}
+
+bool UseIbverbsGpuDirect() {
+  const char* value = std::getenv("MORI_IBVERBS_GPU_DIRECT");
+  return value != nullptr && std::atoi(value) != 0;
 }
 
 std::string DescribeQpTransition(const char* transition, const ibv_qp_attr& attr, int flags,
@@ -128,11 +138,183 @@ IBVerbsDeviceContext::IBVerbsDeviceContext(RdmaDevice* rdma_device, ibv_pd* inPd
 
 IBVerbsDeviceContext::~IBVerbsDeviceContext() {
   std::lock_guard<std::mutex> lock(poolMu);
+  for (auto& it : gpuDirectResources) {
+    if (it.second.atomicIbufMr != nullptr) ibv_dereg_mr(it.second.atomicIbufMr);
+    if (it.second.atomicIbufAddr != nullptr) (void)hipFree(it.second.atomicIbufAddr);
+    for (auto mapping = it.second.mappings.rbegin(); mapping != it.second.mappings.rend();
+         ++mapping) {
+      if (mapping->hostBase != nullptr) (void)hipHostUnregister(mapping->hostBase);
+    }
+  }
+  gpuDirectResources.clear();
   for (auto& it : qpPool) ibv_destroy_qp(it.second);
   for (auto& it : cqPool) ibv_destroy_cq(it.second);
   for (auto* compCh : compChPool) {
     if (compCh) ibv_destroy_comp_channel(compCh);
   }
+}
+
+void IBVerbsDeviceContext::PopulateMlx5GpuDirectHandles(
+    RdmaEndpoint& endpoint, const RdmaEndpointConfig& config) {
+  if (!UseIbverbsGpuDirect() || !config.onGpu ||
+      endpoint.vendorId != RdmaDeviceVendorId::Mellanox) {
+    return;
+  }
+
+  mlx5dv_qp directQp{};
+  mlx5dv_cq directCq{};
+  mlx5dv_obj directObject{};
+  directObject.qp.in = endpoint.ibvHandle.qp;
+  directObject.qp.out = &directQp;
+  directObject.cq.in = endpoint.ibvHandle.cq;
+  directObject.cq.out = &directCq;
+  if (mlx5dv_init_obj(&directObject, MLX5DV_OBJ_QP | MLX5DV_OBJ_CQ) != 0) {
+    throw std::runtime_error("mlx5dv_init_obj(QP|CQ) failed for ibverbs GPU-direct endpoint");
+  }
+  auto IsPowerOfTwo = [](uint32_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
+  };
+  if (directQp.sq.stride != 64 || !IsPowerOfTwo(directQp.sq.wqe_cnt)) {
+    throw std::runtime_error(
+        "ibverbs GPU-direct requires a power-of-two mlx5 SQ with 64-byte WQEs");
+  }
+  if (directCq.cqe_size != 64 || !IsPowerOfTwo(directCq.cqe_cnt)) {
+    throw std::runtime_error(
+        "ibverbs GPU-direct requires a power-of-two mlx5 CQ with 64-byte CQEs");
+  }
+
+  struct RequestedRange {
+    uintptr_t begin;
+    uintptr_t end;
+  };
+  constexpr uintptr_t kPageSize = 4096;
+  auto PageRange = [&](void* pointer, size_t length) -> RequestedRange {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(pointer);
+    return {address & ~(kPageSize - 1),
+            (address + length + kPageSize - 1) & ~(kPageSize - 1)};
+  };
+
+  std::vector<RequestedRange> requested;
+  auto AddRange = [&](void* pointer, size_t length) {
+    if (pointer != nullptr && length != 0) requested.push_back(PageRange(pointer, length));
+  };
+  AddRange(directQp.sq.buf,
+           static_cast<size_t>(directQp.sq.wqe_cnt) * directQp.sq.stride);
+  AddRange(directQp.rq.buf,
+           static_cast<size_t>(directQp.rq.wqe_cnt) * directQp.rq.stride);
+  AddRange(directQp.dbrec, 8);
+  AddRange(directQp.bf.reg, directQp.bf.size);
+  AddRange(directCq.buf,
+           static_cast<size_t>(directCq.cqe_cnt) * directCq.cqe_size);
+  AddRange(directCq.dbrec, 8);
+  std::sort(requested.begin(), requested.end(),
+            [](const RequestedRange& left, const RequestedRange& right) {
+              return std::tie(left.begin, left.end) < std::tie(right.begin, right.end);
+            });
+
+  std::vector<RequestedRange> merged;
+  for (const RequestedRange& range : requested) {
+    if (merged.empty() || range.begin > merged.back().end) {
+      merged.push_back(range);
+    } else {
+      merged.back().end = std::max(merged.back().end, range.end);
+    }
+  }
+
+  GpuDirectResources resources;
+  struct DeviceMapping {
+    uintptr_t hostBegin;
+    uintptr_t hostEnd;
+    uintptr_t deviceBegin;
+  };
+  std::vector<DeviceMapping> deviceMappings;
+  try {
+    for (const RequestedRange& range : merged) {
+      void* hostBase = reinterpret_cast<void*>(range.begin);
+      const size_t length = range.end - range.begin;
+      HIP_RUNTIME_CHECK(hipHostRegister(
+          hostBase, length, hipHostRegisterPortable | hipHostRegisterMapped));
+      void* deviceBase = nullptr;
+      HIP_RUNTIME_CHECK(hipHostGetDevicePointer(&deviceBase, hostBase, 0));
+      resources.mappings.push_back({hostBase, length});
+      deviceMappings.push_back(
+          {range.begin, range.end, reinterpret_cast<uintptr_t>(deviceBase)});
+    }
+
+    auto DeviceAlias = [&](void* hostPointer) -> void* {
+      const uintptr_t address = reinterpret_cast<uintptr_t>(hostPointer);
+      for (const DeviceMapping& mapping : deviceMappings) {
+        if (address >= mapping.hostBegin && address < mapping.hostEnd) {
+          return reinterpret_cast<void*>(mapping.deviceBegin + address - mapping.hostBegin);
+        }
+      }
+      throw std::runtime_error("ibverbs GPU-direct host pointer is outside registered mappings");
+    };
+
+    endpoint.wqHandle.sqAddr = DeviceAlias(directQp.sq.buf);
+    endpoint.wqHandle.rqAddr = DeviceAlias(directQp.rq.buf);
+    endpoint.wqHandle.dbrRecAddr = DeviceAlias(directQp.dbrec);
+    endpoint.wqHandle.dbrAddr = DeviceAlias(directQp.bf.reg);
+    endpoint.wqHandle.rqdbrAddr = DeviceAlias(directQp.dbrec);
+    endpoint.wqHandle.sqWqeNum = directQp.sq.wqe_cnt;
+    endpoint.wqHandle.rqWqeNum = directQp.rq.wqe_cnt;
+
+    endpoint.cqHandle.cqAddr = DeviceAlias(directCq.buf);
+    endpoint.cqHandle.dbrRecAddr = DeviceAlias(directCq.dbrec);
+    endpoint.cqHandle.consIdx = 0;
+    endpoint.cqHandle.needConsIdx = 0;
+    endpoint.cqHandle.cqeNum = directCq.cqe_cnt;
+    endpoint.cqHandle.cqeSize = directCq.cqe_size;
+    endpoint.cqHandle.isCollapsed = 0;
+
+    const size_t atomicIbufSize =
+        (RoundUpPowOfTwo(config.atomicIbufSlots) + 1) * ATOMIC_IBUF_SLOT_SIZE;
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&resources.atomicIbufAddr, atomicIbufSize,
+                                            hipDeviceMallocUncached));
+    HIP_RUNTIME_CHECK(hipMemset(resources.atomicIbufAddr, 0, atomicIbufSize));
+    const int atomicAccess = MaybeAddRelaxedOrderingFlag(
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+        IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+    resources.atomicIbufMr =
+        ibv_reg_mr(pd, resources.atomicIbufAddr, atomicIbufSize, atomicAccess);
+    if (resources.atomicIbufMr == nullptr) {
+      throw std::runtime_error("ibv_reg_mr(atomicIbuf) failed for ibverbs GPU-direct endpoint");
+    }
+    endpoint.atomicIbuf.addr = reinterpret_cast<uintptr_t>(resources.atomicIbufAddr);
+    endpoint.atomicIbuf.lkey = resources.atomicIbufMr->lkey;
+    endpoint.atomicIbuf.rkey = resources.atomicIbufMr->rkey;
+    endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
+
+    MORI_APP_INFO(
+        "ibverbs GPU-direct endpoint qpn={} sq={}x{} rq={}x{} cq={}x{} bf={} dbrec={}",
+        endpoint.handle.qpn, directQp.sq.wqe_cnt, directQp.sq.stride,
+        directQp.rq.wqe_cnt, directQp.rq.stride, directCq.cqe_cnt,
+        directCq.cqe_size, directQp.bf.reg,
+        static_cast<void*>(directQp.dbrec));
+    gpuDirectResources.emplace(endpoint.handle.qpn, std::move(resources));
+  } catch (...) {
+    if (resources.atomicIbufMr != nullptr) ibv_dereg_mr(resources.atomicIbufMr);
+    if (resources.atomicIbufAddr != nullptr) (void)hipFree(resources.atomicIbufAddr);
+    for (auto mapping = resources.mappings.rbegin(); mapping != resources.mappings.rend();
+         ++mapping) {
+      if (mapping->hostBase != nullptr) (void)hipHostUnregister(mapping->hostBase);
+    }
+    throw;
+  }
+}
+
+void IBVerbsDeviceContext::DestroyGpuDirectResources(uint32_t qpn) noexcept {
+  auto resource = gpuDirectResources.find(qpn);
+  if (resource == gpuDirectResources.end()) return;
+  if (resource->second.atomicIbufMr != nullptr)
+    ibv_dereg_mr(resource->second.atomicIbufMr);
+  if (resource->second.atomicIbufAddr != nullptr)
+    (void)hipFree(resource->second.atomicIbufAddr);
+  for (auto mapping = resource->second.mappings.rbegin();
+       mapping != resource->second.mappings.rend(); ++mapping) {
+    if (mapping->hostBase != nullptr) (void)hipHostUnregister(mapping->hostBase);
+  }
+  gpuDirectResources.erase(resource);
 }
 
 RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
@@ -170,25 +352,32 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
   // TODO: we need to add more options in config, include min cqe num for ib_create_cq
   endpoint.ibvHandle.compCh = config.withCompChannel ? ibv_create_comp_channel(context) : nullptr;
   if (config.withCompChannel && !endpoint.ibvHandle.compCh) {
-    MORI_APP_ERROR("ibv_create_comp_channel failed: errno={} ({}); dev={}", errno, strerror(errno),
+    // Capture errno immediately: any intervening libc call before we read it
+    // (e.g. isatty() inside the logging sink when stderr is not a tty, which
+    // sets ENOTTY) would otherwise overwrite the real failure code.
+    const int err = errno;
+    MORI_APP_ERROR("ibv_create_comp_channel failed: errno={} ({}); dev={}", err, strerror(err),
                    GetRdmaDevice()->Name());
-    throw std::runtime_error("ibv_create_comp_channel failed: " + std::string(strerror(errno)));
+    throw std::runtime_error("ibv_create_comp_channel failed: " + std::string(strerror(err)));
   }
 
   endpoint.ibvHandle.cq =
       ibv_create_cq(context, config.maxCqeNum, NULL, endpoint.ibvHandle.compCh, 0);
   if (!endpoint.ibvHandle.cq) {
+    // Capture errno before the lock/log path can overwrite it (see the note at
+    // the comp-channel site).
+    const int err = errno;
     size_t cqPoolSize = 0;
     {
       std::lock_guard<std::mutex> lock(poolMu);
       cqPoolSize = cqPool.size();
     }
     MORI_APP_ERROR(
-        "ibv_create_cq failed: errno={} ({}); dev={} max_cqe={} dev_max_cqe={} cqs_in_pool={}",
-        errno, strerror(errno), GetRdmaDevice()->Name(), config.maxCqeNum,
-        deviceAttr->orig_attr.max_cqe, cqPoolSize);
+        "ibv_create_cq failed: errno={} ({}); dev={} max_cqe={} dev_max_cqe={} cqs_in_pool={}", err,
+        strerror(err), GetRdmaDevice()->Name(), config.maxCqeNum, deviceAttr->orig_attr.max_cqe,
+        cqPoolSize);
     if (endpoint.ibvHandle.compCh) ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
-    throw std::runtime_error("ibv_create_cq failed: " + std::string(strerror(errno)));
+    throw std::runtime_error("ibv_create_cq failed: " + std::string(strerror(err)));
   }
 
   // TODO: should also manage the lifecycle of completion channel && srq
@@ -216,6 +405,12 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
                              .qp_type = IBV_QPT_RC};
   endpoint.ibvHandle.qp = ibv_create_qp(pd, &qpAttr);
   if (!endpoint.ibvHandle.qp) {
+    // Capture errno immediately. Otherwise the lock/log path below overwrites
+    // it before we read it: spdlog's console sink calls isatty(stderr), which
+    // sets errno=ENOTTY when stderr is not a terminal, masking the real error
+    // (commonly EINVAL when the requested QP capacity — max_send_wr x per-WQE
+    // size from sge+inline — exceeds the device's per-QP work-queue budget).
+    const int err = errno;
     size_t qpPoolSize = 0;
     {
       std::lock_guard<std::mutex> lock(poolMu);
@@ -224,15 +419,25 @@ RdmaEndpoint IBVerbsDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& 
     MORI_APP_ERROR(
         "ibv_create_qp failed: errno={} ({}); dev={} port={} max_send_wr={} max_recv_wr={} "
         "max_send_sge={} max_cqe={} dev_caps(max_qp_wr={} max_qp={} max_cqe={}) qps_in_pool={}",
-        errno, strerror(errno), GetRdmaDevice()->Name(), config.portId, qpAttr.cap.max_send_wr,
+        err, strerror(err), GetRdmaDevice()->Name(), config.portId, qpAttr.cap.max_send_wr,
         qpAttr.cap.max_recv_wr, qpAttr.cap.max_send_sge, config.maxCqeNum,
         deviceAttr->orig_attr.max_qp_wr, deviceAttr->orig_attr.max_qp,
         deviceAttr->orig_attr.max_cqe, qpPoolSize);
     ibv_destroy_cq(endpoint.ibvHandle.cq);
     if (endpoint.ibvHandle.compCh) ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
-    throw std::runtime_error("ibv_create_qp failed: " + std::string(strerror(errno)));
+    throw std::runtime_error("ibv_create_qp failed: " + std::string(strerror(err)));
   }
   endpoint.handle.qpn = endpoint.ibvHandle.qp->qp_num;
+
+  try {
+    PopulateMlx5GpuDirectHandles(endpoint, config);
+  } catch (...) {
+    ibv_destroy_qp(endpoint.ibvHandle.qp);
+    ibv_destroy_cq(endpoint.ibvHandle.cq);
+    if (endpoint.ibvHandle.compCh != nullptr)
+      ibv_destroy_comp_channel(endpoint.ibvHandle.compCh);
+    throw;
+  }
 
   if (config.enableSrq)
     assert(endpoint.ibvHandle.srq && (endpoint.ibvHandle.qp->srq == endpoint.ibvHandle.srq));
@@ -374,6 +579,8 @@ bool IBVerbsDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) no
   bool ok = true;
   try {
     std::lock_guard<std::mutex> lock(poolMu);
+
+    DestroyGpuDirectResources(ep.handle.qpn);
 
     auto qpIt = qpPool.find(ep.handle.qpn);
     if (qpIt != qpPool.end() && qpIt->second != nullptr) {

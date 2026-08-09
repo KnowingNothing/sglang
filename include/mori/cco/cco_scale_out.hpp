@@ -330,6 +330,75 @@ __device__ inline static void quietUntil(core::RdmaEndpointDevice* ep, uint32_t 
     }
 #endif
   } else if constexpr (PrvdType == core::ProviderType::MLX5) {
+    if (cq->isCollapsed == 0) {
+      uint64_t remainingMask = core::GetActiveLaneMask();
+      const uint64_t myCqKey = reinterpret_cast<uintptr_t>(cq->cqAddr);
+      const uint64_t myLaneBit = 1ULL << core::WarpLaneId();
+      while (remainingMask != 0) {
+        const int groupLeader = core::GetFirstActiveLaneID(remainingMask);
+        const uint64_t groupCqKey = __shfl(myCqKey, groupLeader);
+        const uint64_t groupMask = __ballot(myCqKey == groupCqKey) & remainingMask;
+        uint32_t groupTarget = 0;
+        uint64_t targetLanes = groupMask;
+        while (targetLanes != 0) {
+          const int lane = core::GetFirstActiveLaneID(targetLanes);
+          const uint32_t laneTarget = __shfl(targetIdx, lane);
+          groupTarget = groupTarget > laneTarget ? groupTarget : laneTarget;
+          targetLanes &= targetLanes - 1;
+        }
+
+        if ((groupMask & myLaneBit) != 0) {
+          auto regularDone = [&]() {
+            uint32_t done = __hip_atomic_load(&wq->doneIdx, __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_AGENT);
+            done = __shfl(done, groupLeader);
+            return static_cast<int32_t>(done - groupTarget) >= 0;
+          };
+          if (!regularDone()) {
+            core::spin_lock_acquire_shared(&cq->pollCqLock, groupMask);
+            while (!regularDone()) {
+              if (core::WarpLaneId() == groupLeader) {
+                const uint32_t done = __hip_atomic_load(
+                    &wq->doneIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                const uint32_t cons = cq->consIdx;
+                uint16_t wqeCounter = 0;
+                int opcode = -1;
+                do {
+                  opcode = core::PollMlx5RegularCqOnce(cq->cqAddr, cq->cqeNum, cons,
+                                                       &wqeCounter);
+                  asm volatile("" ::: "memory");
+                } while (opcode < 0);
+                if (opcode == core::MORI_MLX5_CQE_REQ_ERR ||
+                    opcode == core::MORI_MLX5_CQE_RESP_ERR) {
+                  const uint32_t cqeIndex = cons & (cq->cqeNum - 1);
+                  auto* errorCqe = reinterpret_cast<core::Mlx5ErrCqe*>(
+                      reinterpret_cast<uint8_t*>(cq->cqAddr) +
+                      cqeIndex * sizeof(core::Mlx5Cqe64));
+                  MORI_PRINTF("quietUntil[MLX5 regular]: CQE error %s\n",
+                              core::WcStatusString(core::Mlx5HandleErrorCqe(errorCqe)));
+                  assert(false);
+                } else {
+                  cq->consIdx = cons + 1;
+                  core::UpdateCqDbrRecord<core::ProviderType::MLX5>(*cq, cq->consIdx);
+                  const uint16_t completed16 = static_cast<uint16_t>(wqeCounter + 1);
+                  const uint16_t delta =
+                      static_cast<uint16_t>(completed16 - static_cast<uint16_t>(done));
+                  if (delta != 0) {
+                    __hip_atomic_fetch_max(&wq->doneIdx, done + delta, __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_AGENT);
+                  }
+                }
+              }
+            }
+            core::spin_lock_release_shared(&cq->pollCqLock, groupMask);
+          }
+        }
+        remainingMask &= ~groupMask;
+      }
+      __threadfence_system();
+      return;
+    }
+
     // MLX5: collapsed CQ — read CQE[0] (volatile), reconstruct the 16-bit
     // wqe_counter against doneIdx, advance via max.
     auto done = [&]() {
