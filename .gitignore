@@ -1,0 +1,37 @@
+# Build
+build/
+build*/
+lib*
+dist/*
+
+# Python
+*.egg-info
+.eggs
+*.pyc
+.pytest_cache
+__pycache__
+python/mori/_version.py
+python/mori/_jit-sources/
+python/mori/*.so
+python/mori/cco/*.so
+python/mori/cco/cco.cpp
+python/mori/umbp_master
+python/mori/spdk_proxy
+python/mori/examples/
+python/mori/benchmarks/
+
+# local cco experiments (not for commit)
+examples/cco/**/_dump_*.py
+
+.vscode
+*.log
+*.core
+.claude/*
+!.claude/skills/
+.codex/
+.cache/
+CMakeFiles/
+python/mori/_jit_sources/
+
+# Bundled tools/*.sh files copied into the package at build time
+python/mori/tools/*.sh

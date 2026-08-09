@@ -1,0 +1,39 @@
+[build-system]
+requires = [
+    "setuptools>=61",
+    "setuptools_scm[toml]>=6.2",
+    "wheel",
+    "ninja",
+    "cmake",
+    "pybind11",
+    "Cython>=3.0",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+write_to = "python/mori/_version.py"
+write_to_template = "__version__ = '{version}'\n"
+fallback_version = "0.1.0"
+
+[project]
+name = "amd_mori"
+dynamic = ["version"]
+description = "Modular RDMA Interface — GPU communication library for P2P, RDMA/IBGDA, and SDMA"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# FlyDSL device bindings (mori.cco.device.flydsl) are optional — only needed to
+# author/run cco GDA/LSA kernels from FlyDSL. Pinned to match the FlyDSL ABI the
+# device bitcode targets (see cov in mori.cco.device.bitcode). Install with:
+#   pip install amd_mori[flydsl]
+flydsl = ["flydsl==0.2.2"]
+
+[project.urls]
+Homepage = "https://github.com/ROCm/mori"
+Repository = "https://github.com/ROCm/mori"
+
+[project.scripts]
+mori = "mori.cli:main"
