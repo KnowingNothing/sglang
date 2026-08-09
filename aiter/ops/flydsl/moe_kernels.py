@@ -710,6 +710,7 @@ def compile_flydsl_moe_stage2(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             accumulate=accumulate,
+            persist_m=persist_m,
             sort_block_m=sort_block_m,
             waves_per_eu=0 if waves_per_eu is None else waves_per_eu,
             b_nt=b_nt,

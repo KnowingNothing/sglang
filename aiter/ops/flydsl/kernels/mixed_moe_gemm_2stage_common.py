@@ -5956,6 +5956,11 @@ def compile_mixed_moe_gemm1_a16w4(
         _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
         _ski_tag = f"_ski{_k_batch}" if _k_batch > 1 else ""
         _bias_tag = "_bias" if enable_bias else ""
+        # persist_m changes both the physical grid and the kernel's logical
+        # M-block traversal.  Keep it in the on-disk module name as well as the
+        # Python cache key so a non-persistent binary can never alias a
+        # persistent one.
+        _persist_tag = f"_pm{persist_m}"
         _act_tag = f"_{act}" if act != "silu" else ""
         if act == "situv2":
             # distinct binary per beta so a different beta never aliases
@@ -5972,7 +5977,7 @@ def compile_mixed_moe_gemm1_a16w4(
             f"mfma_a{a_dtype}_w4_moe1_mxfp4_{out_dtype}_{_mode_tag}_{epilog_tag}"
             f"_e{experts}_tk{topk}_d{model_dim}_i{inter_dim}"
             f"_t{tile_m}x{tile_n}x{tile_k}_kb{k_batch}"
-            f"{_wpe_tag}{_ski_tag}{_bias_tag}{_act_tag}{_pad_tag}_abi14"
+            f"{_wpe_tag}{_ski_tag}{_bias_tag}{_act_tag}{_pad_tag}{_persist_tag}_abi14"
         ).replace("-", "_")
     else:
         _fp4q_tag = "_fp4q" if _need_fp4 else ""
@@ -6254,7 +6259,23 @@ def compile_mixed_moe_gemm1_a16w4(
             tx = gpu.thread_id("x")
 
             by = gpu.block_id("x")
-            bx = gpu.block_id("y")
+            bx_persist = gpu.block_id("y")
+
+            # AITER's sorter exposes a static-capacity list to the fused MoE
+            # kernel.  With K3 EP16 that list has 131,967 M blocks, which is
+            # larger than HIP's 65,535 grid.y limit even when only a few rows
+            # are valid.  Match the generic mixed-MoE path: reduce physical
+            # grid.y by persist_m and visit the original logical blocks in a
+            # fixed order inside each workgroup.  All arithmetic and output
+            # indices below still use the original logical bx.
+            c0_p = arith.constant(0, index=True)
+            c1_p = arith.constant(1, index=True)
+            c_pm = arith.constant(persist_m, index=True)
+            for_persist = scf.ForOp(c0_p, c_pm, c1_p)
+            for_ip = ir.InsertionPoint(for_persist.body)
+            for_ip.__enter__()
+            mi_p = for_persist.induction_variable
+            bx = bx_persist * c_pm + mi_p
 
             bx_m = bx * arith.index(tile_m)
             numids_rsrc = ptr_buffer_resource(
@@ -8100,6 +8121,13 @@ def compile_mixed_moe_gemm1_a16w4(
                         body_row=_stage1_store_row,
                     )
 
+            # Ping/pong LDS is reused by the next logical M block handled by
+            # this physical workgroup.  Keep the same inter-iteration barrier
+            # used by the generic persistent-M implementation.
+            gpu.barrier()
+            scf.YieldOp([])
+            for_ip.__exit__(None, None, None)
+
             return
 
     # -- Host launcher --
@@ -8202,8 +8230,12 @@ def compile_mixed_moe_gemm1_a16w4(
                 / arith.constant(2, index=True)
             )
         if const_expr(is_a16w4_stage1):
-            # A16W4 stage1 has no persistent-M scheduling; gy = size_expert_ids.
-            gy = arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
+            _c_pm_l = arith.constant(persist_m, index=True)
+            gy = (
+                arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
+                + _c_pm_l
+                - arith.constant(1, index=True)
+            ) / _c_pm_l
         else:
             _c_pm_l = arith.constant(persist_m, index=True)
             gy = (
@@ -8252,6 +8284,7 @@ def compile_mixed_moe_gemm2_a16w4(
     enable_bias: bool = False,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
+    persist_m: int = 1,
     sort_block_m: int = 0,
     waves_per_eu: int = 0,
     b_nt: int = 2,
@@ -8438,7 +8471,13 @@ def compile_mixed_moe_gemm2_a16w4(
     if is_a16w4:
         _persistent = False
         _cu_num = 0
-        persist_m = 1  # A16W4: single M-tile per WG
+        # The public stage2 launcher already raises persist_m when the static
+        # sorted-capacity grid would exceed HIP's 65,535 grid.y limit.  Do not
+        # discard that value here: the legacy loop below supports consecutive
+        # logical M tiles for A8W4/MXFP4 just as it does for the generic path.
+        # Clamp non-positive requests to one to preserve the prior A16W4
+        # behavior for callers that did not resolve a grid limit upstream.
+        persist_m = max(int(persist_m), 1)
     else:
         _persistent = persist_m <= 0
         if _persistent:
@@ -10316,6 +10355,7 @@ def compile_a16w4_moe_gemm2(
     enable_bias: bool = False,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
+    persist_m: int = 1,
     accumulate: bool = True,
     waves_per_eu: int = 0,
     k_batch: int = 1,
@@ -10337,6 +10377,7 @@ def compile_a16w4_moe_gemm2(
         enable_bias=enable_bias,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
+        persist_m=persist_m,
         accumulate=accumulate,
         waves_per_eu=waves_per_eu,
         k_batch=k_batch,
