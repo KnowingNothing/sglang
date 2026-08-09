@@ -182,6 +182,22 @@ def test_public_a8w4_and_mori_live_prefix(monkeypatch):
     expert_mask[local_start : local_start + experts] = 1
     num_local_tokens = torch.tensor([tokens], dtype=torch.int32)
 
+    original_mxfp8_quant_moe_sort = (
+        fused_moe_module.fused_dynamic_mxfp8_quant_moe_sort
+    )
+    observed_num_rows = []
+
+    def record_mxfp8_quant_moe_sort(*args, num_rows=None, **kwargs):
+        observed_num_rows.append(num_rows)
+        return original_mxfp8_quant_moe_sort(
+            *args, num_rows=num_rows, **kwargs
+        )
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_dynamic_mxfp8_quant_moe_sort",
+        record_mxfp8_quant_moe_sort,
+    )
     actual_mori = fused_moe(
         arena_hidden,
         w1,
@@ -209,3 +225,5 @@ def test_public_a8w4_and_mori_live_prefix(monkeypatch):
     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
     torch.testing.assert_close(actual_mori[:tokens], actual, atol=0, rtol=0)
     assert torch.isfinite(actual_mori[:tokens]).all()
+    assert len(observed_num_rows) == 2
+    assert all(num_rows is num_local_tokens for num_rows in observed_num_rows)
