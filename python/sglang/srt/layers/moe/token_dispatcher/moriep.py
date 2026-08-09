@@ -379,6 +379,10 @@ def init_mori_op(
 
     mori_config = mori.ops.EpDispatchCombineConfig(**common_kwargs)
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
+    # The operator allocates and zeroes symmetric buffers locally. A faster rank
+    # must not issue an RDMA write while a peer is still zero-initializing the
+    # corresponding remote buffer, or the late memset can erase the payload.
+    torch.distributed.barrier(group=cpu_group)
     return mori_op
 
 
