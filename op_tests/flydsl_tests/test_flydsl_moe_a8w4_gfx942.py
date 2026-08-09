@@ -227,3 +227,38 @@ def test_public_a8w4_and_mori_live_prefix(monkeypatch):
     assert torch.isfinite(actual_mori[:tokens]).all()
     assert len(observed_num_rows) == 2
     assert all(num_rows is num_local_tokens for num_rows in observed_num_rows)
+
+
+@pytest.mark.parametrize("live_tokens", [1, 32])
+def test_mxfp8_quant_device_live_prefix_matches_truncated_input(live_tokens):
+    """A CU-sized device-live grid must be byte-exact on every live row."""
+    torch.set_default_device("cuda")
+    torch.manual_seed(20260809)
+
+    capacity_rows = 8192
+    topk = 16
+    cols = 3072
+    live_rows = live_tokens * topk
+    full_input = torch.randn(
+        (capacity_rows, cols), dtype=torch.bfloat16
+    ) / 10
+    num_local_tokens = torch.tensor([live_tokens], dtype=torch.int32)
+
+    full_out, full_scale = per_1x32_mx_quant_hip(
+        full_input,
+        quant_dtype=dtypes.fp8,
+        scale_type=dtypes.fp8_e8m0,
+        shuffle=False,
+        num_rows=num_local_tokens,
+        num_rows_factor=topk,
+    )
+    reference_out, reference_scale = per_1x32_mx_quant_hip(
+        full_input[:live_rows],
+        quant_dtype=dtypes.fp8,
+        scale_type=dtypes.fp8_e8m0,
+        shuffle=False,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(full_out[:live_rows], reference_out)
+    assert torch.equal(full_scale[:live_rows], reference_scale)
