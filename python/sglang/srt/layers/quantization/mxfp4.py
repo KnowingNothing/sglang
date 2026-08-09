@@ -1218,6 +1218,73 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             dispatch_output._replace(hidden_states=x_padded), quant_info
         )
 
+    def _apply_aiter(self, layer, dispatch_output):
+        """Run native packed-MXFP4 weights through the selected AITER runner.
+
+        This helper accepts every dispatch format supported by ``MoeRunner``.
+        In particular, MORI/DeepEP outputs carry ``topk_ids`` and
+        ``topk_weights`` directly and intentionally have no ``topk_output``
+        attribute.  The AITER runner's registered pre/post-permute functions
+        consume those fields without converting the dispatch object to the
+        standard format.
+        """
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            AiterMoeQuantInfo,
+            AiterQuantType,
+        )
+
+        x = dispatch_output.hidden_states
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+        else:
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+        # `.view()` creates a fresh tensor that drops the `is_shuffled`
+        # marker we set in process_weights_after_loading. Re-tag it so the
+        # downstream aiter.fused_moe selects preshuffle_on kernels.
+        if getattr(layer.w13_weight, "is_shuffled", False):
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
+
+        # Skip the explicit pad if x already arrives at the padded
+        # hidden_size (the upstream RMSNorm fused the pad into its output).
+        if x.shape[-1] == self.hidden_size:
+            x_padded = x
+        else:
+            x_padded = torch.nn.functional.pad(
+                x, (0, self.hidden_pad), mode="constant", value=0.0
+            )
+        quant_info = AiterMoeQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            quant_type=AiterQuantType.PER_1X32,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            b13=layer.w13_weight_bias if self.with_bias else None,
+            b2=layer.w2_weight_bias if self.with_bias else None,
+            expert_mask=layer.dispatcher.expert_mask_gpu,
+            doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
+            # Applies swiglu clamp for GPT-OSS-style activations. K3 SiTU
+            # uses gemm1_clamp_limit as linear_beta, which is forwarded by
+            # the AITER runner and must not be treated as swiglu_limit.
+            swiglu_limit=(
+                0.0
+                if self.moe_runner_config.activation == "situ"
+                else (
+                    self.moe_runner_config.gemm1_clamp_limit
+                    or self.moe_runner_config.swiglu_limit
+                    or 0.0
+                )
+            ),
+        )
+        return self.runner.run(
+            dispatch_output._replace(hidden_states=x_padded), quant_info
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1246,6 +1313,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         x = dispatch_output.hidden_states
+
+        # Route by the runner that create_moe_runner actually selected, not by
+        # whether AITER happens to be importable. This must precede the
+        # standard-only `.topk_output` access below because MORI/DeepEP
+        # dispatch outputs expose topk_ids/topk_weights directly.
+        runner = getattr(self, "runner", None)
+        if runner is not None and runner.runner_backend.is_aiter():
+            return self._apply_aiter(layer, dispatch_output)
+
         topk_output = dispatch_output.topk_output
         if _is_cpu:
             if use_intel_amx_backend(layer):
@@ -1516,65 +1592,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
-        if _use_aiter:
-            from sglang.srt.layers.moe.moe_runner.aiter import (
-                AiterMoeQuantInfo,
-                AiterQuantType,
-            )
-
-            if hasattr(torch, "float4_e2m1fn_x2"):
-                w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
-                w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
-            else:
-                w13_weight = layer.w13_weight
-                w2_weight = layer.w2_weight
-
-            # `.view()` creates a fresh tensor that drops the `is_shuffled`
-            # marker we set in process_weights_after_loading. Re-tag it so the
-            # downstream aiter.fused_moe selects preshuffle_on kernels.
-            if getattr(layer.w13_weight, "is_shuffled", False):
-                w13_weight.is_shuffled = True
-                w2_weight.is_shuffled = True
-
-            # Skip the explicit pad if x already arrives at the padded
-            # hidden_size (the upstream RMSNorm fused the pad into its
-            # output — see RMSNorm.x_pad_to_multiple). Saves a separate
-            # zero-pad kernel launch per layer.
-            if x.shape[-1] == self.hidden_size:
-                x_padded = x
-            else:
-                x_padded = torch.nn.functional.pad(
-                    x, (0, self.hidden_pad), mode="constant", value=0.0
-                )
-            quant_info = AiterMoeQuantInfo(
-                w13_weight=w13_weight,
-                w2_weight=w2_weight,
-                quant_type=AiterQuantType.PER_1X32,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                b13=layer.w13_weight_bias if self.with_bias else None,
-                b2=layer.w2_weight_bias if self.with_bias else None,
-                expert_mask=layer.dispatcher.expert_mask_gpu,
-                doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
-                hidden_pad=self.hidden_pad,
-                intermediate_pad=self.intermediate_pad,
-                # Applies swiglu clamp for GPT-OSS-style activations. K3 SiTU
-                # uses gemm1_clamp_limit as linear_beta, which is forwarded by
-                # the AITER runner and must not be treated as swiglu_limit.
-                swiglu_limit=(
-                    0.0
-                    if self.moe_runner_config.activation == "situ"
-                    else (
-                        self.moe_runner_config.gemm1_clamp_limit
-                        or self.moe_runner_config.swiglu_limit
-                        or 0.0
-                    )
-                ),
-            )
-            return self.runner.run(
-                dispatch_output._replace(hidden_states=x_padded), quant_info
-            )
-
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
