@@ -8839,15 +8839,36 @@ def compile_mixed_moe_gemm2_a16w4(
             _c1_p = arith.constant(1, index=True)
 
             if const_expr(_persistent):
-                # Expert-phase scheduling: contiguous M-tile dispatch.
-                # grid_y = cu_num, each CTA handles a contiguous chunk of M-tiles:
-                #   [bx_persist * tiles_per_block, ..., (bx_persist+1) * tiles_per_block - 1]
-                # Adjacent blocks process adjacent M-tiles -> same expert -> B weight L2 reuse.
+                # Expert-phase scheduling: distribute exactly the live M tiles.
+                # A ceil-divided chunk gives every CU the same trip count and
+                # therefore makes high CU ids enter one invalid iteration when
+                # total_m_tiles < cu_num (the common K3 EP32 prefill case).  That
+                # invalid iteration reads uninitialized sorted expert/token
+                # metadata before blk_valid can suppress the GEMM.  Match the
+                # stage1 quotient+remainder schedule instead: the first
+                # remainder CUs receive one extra contiguous tile, and CUs with
+                # no live tile execute a zero-trip loop.
                 _c_cu = arith.constant(_cu_num, index=True)
                 _c_tm_p = arith.constant(tile_m, index=True)
                 _num_valid_idx = arith.index_cast(ir.IndexType.get(), num_valid_i32)
                 _total_m_tiles = (_num_valid_idx + _c_tm_p - _c1_p) / _c_tm_p
-                _tiles_per_block = (_total_m_tiles + _c_cu - _c1_p) / _c_cu
+                _tiles_per_block_base = _total_m_tiles / _c_cu
+                _tiles_remainder = _total_m_tiles - (
+                    _tiles_per_block_base * _c_cu
+                )
+                _has_extra_tile = arith.cmpi(
+                    CmpIPredicate.ult, bx_persist, _tiles_remainder
+                )
+                _extra_tile = arith.select(
+                    _has_extra_tile, _c1_p, _c0_p
+                )
+                _tiles_per_block = _tiles_per_block_base + _extra_tile
+                _start_tail = arith.select(
+                    _has_extra_tile, bx_persist, _tiles_remainder
+                )
+                _persist_start_tile = (
+                    bx_persist * _tiles_per_block_base + _start_tail
+                )
                 _i1 = ir.IntegerType.get_signless(1)
                 _init_active = arith.constant(1, type=_i1)
                 _for_persist = scf.ForOp(_c0_p, _tiles_per_block, _c1_p, [_init_active])
@@ -8869,7 +8890,7 @@ def compile_mixed_moe_gemm2_a16w4(
 
             if const_expr(_persistent):
                 _still_active = _for_persist.inner_iter_args[0]
-                bx = bx_persist * _tiles_per_block + _mi_p
+                bx = _persist_start_tile + _mi_p
             else:
                 _prev_expert_i32 = _for_persist.inner_iter_args[0]
                 _prev_expert_b_base = _for_persist.inner_iter_args[1]

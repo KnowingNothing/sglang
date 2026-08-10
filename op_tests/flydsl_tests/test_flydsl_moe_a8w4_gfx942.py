@@ -1,6 +1,7 @@
 """MI308X/gfx942 native MXFP4-storage, FP8-compute MoE regressions."""
 
 import functools
+import os
 
 import pytest
 import torch
@@ -262,3 +263,100 @@ def test_mxfp8_quant_device_live_prefix_matches_truncated_input(live_tokens):
 
     assert torch.equal(full_out[:live_rows], reference_out)
     assert torch.equal(full_scale[:live_rows], reference_scale)
+
+
+@pytest.mark.skipif(
+    os.environ.get("AITER_RUN_K3_GFX942_FULLSHAPE", "0") != "1",
+    reason="opt-in K3 full-shape MI308X regression",
+)
+def test_k3_ep32_fullshape_a8w4_prefill_is_finite():
+    """Cover the production K3 EP32 persistent-M route on one MI308X.
+
+    The small public regression above does not enter persistent-M.  Production
+    uses 896 global experts, 28 local experts, topk=16, hidden=7168 and
+    intermediate=3072.  The global expert mask makes the static sorter arena
+    1001 M-blocks even when only 162 received rows are live, which is the
+    boundary that selects the CU-sized persistent physical grid.
+
+    Run this test in its own process with HIP_LAUNCH_BLOCKING=1 so a memory
+    fault is attributed to this operator instead of a later synchronization.
+    """
+    torch.set_default_device("cuda")
+    torch.manual_seed(20260810)
+
+    tokens = 162
+    model_dim = 7168
+    inter_dim = 3072
+    global_experts = 896
+    local_experts = 28
+    topk = 16
+
+    hidden = torch.randn((tokens, model_dim), dtype=torch.bfloat16) / 10
+
+    # Simulate MORI receive rows: each row has exactly one route owned by this
+    # EP rank and fifteen non-local routes.  All ids remain valid global ids.
+    rows = torch.arange(tokens, dtype=torch.int64).unsqueeze(1)
+    slots = torch.arange(topk, dtype=torch.int64).unsqueeze(0)
+    topk_ids = local_experts + (
+        rows * (topk - 1) + slots
+    ) % (global_experts - local_experts)
+    topk_ids[:, 0] = torch.arange(tokens, dtype=torch.int64) % local_experts
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32)
+    topk_weights /= topk_weights.sum(dim=1, keepdim=True)
+
+    expert_mask = torch.zeros(global_experts, dtype=torch.int32)
+    expert_mask[:local_experts] = 1
+    num_local_tokens = torch.tensor([tokens], dtype=torch.int32)
+
+    w1 = torch.randint(
+        0,
+        256,
+        (local_experts, 2 * inter_dim, model_dim // 2),
+        dtype=torch.uint8,
+    ).view(dtypes.fp4x2)
+    w2 = torch.randint(
+        0,
+        256,
+        (local_experts, model_dim, inter_dim // 2),
+        dtype=torch.uint8,
+    ).view(dtypes.fp4x2)
+    w1_scale = torch.randint(
+        116,
+        124,
+        (local_experts * 2 * inter_dim, model_dim // 32),
+        dtype=torch.uint8,
+    )
+    w2_scale = torch.randint(
+        116,
+        124,
+        (local_experts * model_dim, inter_dim // 32),
+        dtype=torch.uint8,
+    )
+
+    w1 = shuffle_weight_a16w4(w1, 16, True)
+    w2 = shuffle_weight_a16w4(w2, 16, False)
+    w1_scale = shuffle_scale_a16w4(w1_scale, local_experts, True)
+    w2_scale = shuffle_scale_a16w4(w2_scale, local_experts, False)
+
+    actual = fused_moe(
+        hidden,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        expert_mask=expert_mask,
+        activation=ActivationType.Situv2,
+        quant_type=QuantType.per_1x32,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        num_local_tokens=num_local_tokens,
+        q_dtype_a=dtypes.fp8,
+        beta=4.0,
+        linear_beta=25.0,
+        gate_mode=GateMode.INTERLEAVE.value,
+    )
+    torch.cuda.synchronize()
+
+    assert actual.shape == (tokens, model_dim)
+    assert torch.isfinite(actual).all()
