@@ -71,6 +71,10 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        # Decode tracking consumes the device mask directly in its kernels. Keep
+        # this host flag extend-only: scalar-reading a GPU mask here synchronizes
+        # the whole forward stream before decode can enqueue its next work.
+        has_mamba_track_mask = False
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -186,10 +190,11 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
+                has_mamba_track_mask = bool(
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()
-                ):
+                )
+                if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -202,11 +207,6 @@ class MambaAttnBackendBase(AttentionBackend):
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
-
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
