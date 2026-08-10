@@ -1,10 +1,13 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
     _MoriEPDispatcherImplLowLatency,
     _MoriEPDispatcherImplNormal,
     _get_mori_gpu_per_node,
+    _require_mori_shmem_init_success,
 )
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -31,6 +34,12 @@ def test_interleaved_ep_subgroup_counts_only_local_members():
     ranks = list(range(0, 8, 2)) + list(range(8, 16, 2))
     assert _get_mori_gpu_per_node(_group(2, ranks)) == 4
     assert _get_mori_gpu_per_node(_group(10, ranks)) == 4
+
+
+def test_mori_shmem_init_status_is_checked_before_operator_construction():
+    _require_mori_shmem_init_success(0)
+    with pytest.raises(RuntimeError, match="status -1"):
+        _require_mori_shmem_init_success(-1)
 
 
 def test_auto_mode_builds_distinct_normal_and_low_latency_contracts(

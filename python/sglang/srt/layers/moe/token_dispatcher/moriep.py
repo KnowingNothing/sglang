@@ -58,6 +58,14 @@ if _is_hip:
 logger = logging.getLogger(__name__)
 
 
+def _require_mori_shmem_init_success(status) -> None:
+    if status != 0:
+        raise RuntimeError(
+            "MORI shmem initialization failed with status "
+            f"{status!r}; refusing to construct the dispatch/combine operator"
+        )
+
+
 def _should_record_expert_distribution() -> bool:
     recorder = get_global_expert_distribution_recorder()
     if recorder.recording:
@@ -279,7 +287,8 @@ def init_mori_op(
         # If new group is newly registered then need to init mori shmem. However
         # if the group is registered already then need to skip init mori shmem
         # and reuse the previous one.
-        mori.shmem.shmem_torch_process_group_init(group_name)
+        shmem_init_status = mori.shmem.shmem_torch_process_group_init(group_name)
+        _require_mori_shmem_init_success(shmem_init_status)
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
     async_mode = deepep_mode.enable_low_latency() or enable_sdma
