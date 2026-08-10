@@ -21,7 +21,7 @@ INTERMEDIATE_SIZE = 3072
 TOPK = 16
 NUM_EXPERTS = 896
 EXPERTS_PER_RANK = NUM_EXPERTS // WORLD_SIZE
-ITERATIONS = 16
+ITERATIONS = int(os.environ.get("PROBE_ITERATIONS", "16"))
 
 
 def sync(label: str, rank: int) -> None:
@@ -92,7 +92,7 @@ def main() -> None:
         hidden_dim=HIDDEN_SIZE,
         scale_dim=HIDDEN_SIZE // 32,
         scale_type_size=torch.float8_e8m0fnu.itemsize,
-        max_token_type_size=4,
+        max_token_type_size=torch.bfloat16.itemsize,
         max_num_inp_token_per_rank=1,
         num_experts_per_rank=EXPERTS_PER_RANK,
         num_experts_per_token=TOPK,
