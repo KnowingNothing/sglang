@@ -21,6 +21,8 @@ TOPK = 16
 NUM_EXPERTS = 896
 EXPERTS_PER_RANK = NUM_EXPERTS // WORLD_SIZE
 PREFILL_TOKENS_PER_ACTIVE_RANK = 394
+PREFILL_LAYERS = int(os.environ.get("PROBE_PREFILL_LAYERS", "1"))
+PREFILL_SYNC_INTERVAL = int(os.environ.get("PROBE_PREFILL_SYNC_INTERVAL", "0"))
 DECODE_ITERATIONS = int(os.environ.get("PROBE_DECODE_ITERATIONS", "128"))
 
 
@@ -217,7 +219,8 @@ def main() -> None:
             "probe_contract "
             f"gpu={props.name} arch={props.gcnArchName} world_size={world_size} "
             f"prefill_active_ranks=8 prefill_tokens_per_active_rank="
-            f"{PREFILL_TOKENS_PER_ACTIVE_RANK} decode_active_ranks=8 "
+            f"{PREFILL_TOKENS_PER_ACTIVE_RANK} prefill_layers={PREFILL_LAYERS} "
+            f"prefill_sync_interval={PREFILL_SYNC_INTERVAL} decode_active_ranks=8 "
             f"decode_idle_ranks=24 decode_iterations={DECODE_ITERATIONS} "
             f"topk={TOPK} local_experts={EXPERTS_PER_RANK} "
             f"normal_max_input=16384 normal_max_recv=524288 "
@@ -230,40 +233,49 @@ def main() -> None:
     normal_op = make_normal_op(rank)
     sync("normal_initialized", rank)
     prefill_tokens = PREFILL_TOKENS_PER_ACTIVE_RANK if rank < 8 else 0
-    hidden, topk_weights, topk_ids = make_inputs(
-        rank=rank,
-        num_tokens=prefill_tokens,
-        iteration=0,
-        device=device,
-    )
-    (
-        recv_hidden,
-        recv_topk_weights,
-        _recv_scales,
-        recv_topk_ids,
-        recv_count,
-    ) = normal_op.dispatch(hidden, topk_weights, None, topk_ids)
-    sync("normal_dispatch", rank)
-    expert_output = run_aiter(
-        hidden_states=recv_hidden,
-        topk_weights=recv_topk_weights,
-        topk_ids=recv_topk_ids,
-        recv_count=recv_count,
-        expert_mask=expert_mask,
-        weights=weights,
-    )
-    combined, _ = normal_op.combine(expert_output, None, topk_ids)
-    sync("normal_combine", rank)
+    combined = None
+    recv_count = None
+    for layer in range(PREFILL_LAYERS):
+        hidden, topk_weights, topk_ids = make_inputs(
+            rank=rank,
+            num_tokens=prefill_tokens,
+            iteration=layer,
+            device=device,
+        )
+        (
+            recv_hidden,
+            recv_topk_weights,
+            _recv_scales,
+            recv_topk_ids,
+            recv_count,
+        ) = normal_op.dispatch(hidden, topk_weights, None, topk_ids)
+        expert_output = run_aiter(
+            hidden_states=recv_hidden,
+            topk_weights=recv_topk_weights,
+            topk_ids=recv_topk_ids,
+            recv_count=recv_count,
+            expert_mask=expert_mask,
+            weights=weights,
+        )
+        combined, _ = normal_op.combine(expert_output, None, topk_ids)
+        if PREFILL_SYNC_INTERVAL and (layer + 1) % PREFILL_SYNC_INTERVAL == 0:
+            sync(f"normal_layer_{layer}", rank)
+        if rank == 0 and (layer < 4 or (layer + 1) % 16 == 0):
+            print(f"normal_layer_enqueued layer={layer}", flush=True)
+        del recv_hidden, recv_topk_weights, recv_topk_ids, expert_output
+
+    sync("normal_layers_completed", rank)
+    assert combined is not None
+    assert recv_count is not None
     if prefill_tokens and not torch.isfinite(combined[:prefill_tokens]).all():
         raise RuntimeError(f"rank={rank} non-finite normal combine output")
     if rank == 0:
         print(
-            f"normal_ok rank0_source_tokens={prefill_tokens} "
+            f"normal_ok layers={PREFILL_LAYERS} rank0_source_tokens={prefill_tokens} "
             f"rank0_recv_tokens={int(recv_count.item())}",
             flush=True,
         )
-    del recv_hidden, recv_topk_weights, recv_topk_ids
-    del expert_output, combined
+    del combined
 
     asyncll_op = make_asyncll_op(rank)
     sync("asyncll_initialized_after_normal", rank)
