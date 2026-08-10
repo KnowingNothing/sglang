@@ -12,7 +12,6 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
-from sglang.kernels.ops.moe.rocm_moe_utils import upscale_mxfp4
 
 
 WORLD_SIZE = 32
@@ -84,16 +83,10 @@ def make_inputs(
     iteration: int,
     device: torch.device,
 ):
-    raw = torch.full(
-        (num_tokens, HIDDEN_SIZE // 2),
-        fill_value=(0x11 + iteration) & 0xFF,
-        dtype=torch.uint8,
-        device=device,
-    )
-    hidden = raw.view(torch.float4_e2m1fn_x2)
-    scales = torch.ones(
-        (num_tokens, HIDDEN_SIZE // 32),
-        dtype=torch.float8_e8m0fnu,
+    hidden = torch.full(
+        (num_tokens, HIDDEN_SIZE),
+        fill_value=(iteration % 7 + 1) / 16.0,
+        dtype=torch.bfloat16,
         device=device,
     )
     weights = torch.full(
@@ -115,13 +108,12 @@ def make_inputs(
         ) % NUM_EXPERTS
     else:
         indices = torch.empty((0, TOPK), dtype=torch.int32, device=device)
-    return hidden, weights, scales, indices
+    return hidden, weights, indices
 
 
 def run_aiter(
     *,
-    packed_hidden: torch.Tensor,
-    packed_scales: torch.Tensor,
+    hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     recv_count: torch.Tensor,
@@ -129,14 +121,8 @@ def run_aiter(
     weights,
 ):
     w1, w2, w1_scale, w2_scale = weights
-    compute_input = upscale_mxfp4(
-        packed_hidden,
-        packed_scales,
-        recv_count,
-        torch.bfloat16,
-    )
     expert_output = fused_moe(
-        hidden_states=compute_input,
+        hidden_states=hidden_states,
         w1=w1,
         w2=w2,
         topk_weight=topk_weights,
@@ -155,17 +141,17 @@ def run_aiter(
         gate_mode=GateMode.INTERLEAVE.value,
         fake_topk_slots=0,
     )
-    return compute_input, expert_output
+    return expert_output
 
 
 def make_normal_op(rank: int):
     config = mori.ops.EpDispatchCombineConfig(
-        data_type=torch.float4_e2m1fn_x2,
+        data_type=torch.bfloat16,
         rank=rank,
         world_size=WORLD_SIZE,
         hidden_dim=HIDDEN_SIZE,
-        scale_dim=HIDDEN_SIZE // 32,
-        scale_type_size=torch.float8_e8m0fnu.itemsize,
+        scale_dim=0,
+        scale_type_size=torch.float32.itemsize,
         max_token_type_size=torch.bfloat16.itemsize,
         max_num_inp_token_per_rank=16384,
         num_experts_per_rank=EXPERTS_PER_RANK,
@@ -178,19 +164,19 @@ def make_normal_op(rank: int):
         kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
         gpu_per_node=8,
         num_qp_per_pe=2,
-        quant_type="fp8_blockwise",
+        quant_type="none",
     )
     return mori.ops.EpDispatchCombineOp(config)
 
 
 def make_asyncll_op(rank: int):
     config = mori.ops.EpDispatchCombineConfig(
-        data_type=torch.float4_e2m1fn_x2,
+        data_type=torch.bfloat16,
         rank=rank,
         world_size=WORLD_SIZE,
         hidden_dim=HIDDEN_SIZE,
-        scale_dim=HIDDEN_SIZE // 32,
-        scale_type_size=torch.float8_e8m0fnu.itemsize,
+        scale_dim=0,
+        scale_type_size=torch.float32.itemsize,
         max_token_type_size=torch.bfloat16.itemsize,
         max_num_inp_token_per_rank=1,
         num_experts_per_rank=EXPERTS_PER_RANK,
@@ -203,7 +189,7 @@ def make_asyncll_op(rank: int):
         kernel_type=mori.ops.EpDispatchCombineKernelType.AsyncLL,
         gpu_per_node=8,
         num_qp_per_pe=2,
-        quant_type="fp8_blockwise",
+        quant_type="none",
     )
     return mori.ops.EpDispatchCombineOp(config)
 
@@ -236,30 +222,30 @@ def main() -> None:
             f"topk={TOPK} local_experts={EXPERTS_PER_RANK} "
             f"normal_max_input=16384 normal_max_recv=524288 "
             f"decode_max_input=1 decode_max_recv=32 "
-            f"expert_weight_storage=mxfp4 compute_input=fp8",
+            f"dispatch=bf16 combine=bf16 expert_weight_storage=mxfp4 "
+            f"activation_compute=fp8",
             flush=True,
         )
 
     normal_op = make_normal_op(rank)
     sync("normal_initialized", rank)
     prefill_tokens = PREFILL_TOKENS_PER_ACTIVE_RANK if rank < 8 else 0
-    hidden, topk_weights, scales, topk_ids = make_inputs(
+    hidden, topk_weights, topk_ids = make_inputs(
         rank=rank,
         num_tokens=prefill_tokens,
         iteration=0,
         device=device,
     )
     (
-        packed_hidden,
+        recv_hidden,
         recv_topk_weights,
-        recv_scales,
+        _recv_scales,
         recv_topk_ids,
         recv_count,
-    ) = normal_op.dispatch(hidden, topk_weights, scales, topk_ids)
+    ) = normal_op.dispatch(hidden, topk_weights, None, topk_ids)
     sync("normal_dispatch", rank)
-    compute_input, expert_output = run_aiter(
-        packed_hidden=packed_hidden,
-        packed_scales=recv_scales,
+    expert_output = run_aiter(
+        hidden_states=recv_hidden,
         topk_weights=recv_topk_weights,
         topk_ids=recv_topk_ids,
         recv_count=recv_count,
@@ -276,8 +262,8 @@ def main() -> None:
             f"rank0_recv_tokens={int(recv_count.item())}",
             flush=True,
         )
-    del packed_hidden, recv_topk_weights, recv_scales, recv_topk_ids
-    del compute_input, expert_output, combined
+    del recv_hidden, recv_topk_weights, recv_topk_ids
+    del expert_output, combined
 
     asyncll_op = make_asyncll_op(rank)
     sync("asyncll_initialized_after_normal", rank)
@@ -286,23 +272,22 @@ def main() -> None:
         active_dp = iteration % 4
         active_begin = active_dp * 8
         num_tokens = 1 if active_begin <= rank < active_begin + 8 else 0
-        hidden, topk_weights, scales, topk_ids = make_inputs(
+        hidden, topk_weights, topk_ids = make_inputs(
             rank=rank,
             num_tokens=num_tokens,
             iteration=iteration + 1,
             device=device,
         )
         (
-            packed_hidden,
+            recv_hidden,
             recv_topk_weights,
-            recv_scales,
+            _recv_scales,
             recv_topk_ids,
             recv_count,
-        ) = asyncll_op.dispatch_send(hidden, topk_weights, scales, topk_ids)
+        ) = asyncll_op.dispatch_send(hidden, topk_weights, None, topk_ids)
         asyncll_op.dispatch_recv()
-        compute_input, expert_output = run_aiter(
-            packed_hidden=packed_hidden,
-            packed_scales=recv_scales,
+        expert_output = run_aiter(
+            hidden_states=recv_hidden,
             topk_weights=recv_topk_weights,
             topk_ids=recv_topk_ids,
             recv_count=recv_count,
