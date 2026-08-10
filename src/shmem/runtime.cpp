@@ -26,6 +26,8 @@
 // and GpuStates management (shared with init.cpp).
 
 #include <cassert>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "hip/hip_runtime_api.h"
@@ -48,6 +50,24 @@ namespace {
 std::vector<GpuStatesAddrProvider>& GpuStatesProviders() {
   static std::vector<GpuStatesAddrProvider> instance;
   return instance;
+}
+
+ShmemStates* RequireInitializedStates(const char* api) {
+  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  if (states->status != ShmemStatesStatus::Initialized || states->bootStates == nullptr) {
+    throw std::runtime_error(std::string(api) +
+                             " requires successful MORI shmem initialization");
+  }
+  return states;
+}
+
+application::Context* RequireInitializedRdmaContext(const char* api) {
+  ShmemStates* states = RequireInitializedStates(api);
+  if (states->rdmaStates == nullptr || states->rdmaStates->commContext == nullptr) {
+    throw std::runtime_error(std::string(api) +
+                             " requires an initialized MORI RDMA context");
+  }
+  return states->rdmaStates->commContext;
 }
 }  // namespace
 
@@ -170,23 +190,21 @@ int CopyGpuStatesToSymbol(void* deviceSymbolAddr) {
 /* ---------------------------------------------------------------------------------------------- */
 
 int ShmemMyPe() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  ShmemStates* states = RequireInitializedStates("ShmemMyPe");
   return states->bootStates->rank;
 }
 
 int ShmemNPes() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
+  ShmemStates* states = RequireInitializedStates("ShmemNPes");
   return states->bootStates->worldSize;
 }
 
 int ShmemNumQpPerPe() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  return states->rdmaStates->commContext->GetNumQpPerPe();
+  return RequireInitializedRdmaContext("ShmemNumQpPerPe")->GetNumQpPerPe();
 }
 
 bool ShmemSdmaEnabled() {
-  ShmemStates* states = ShmemStatesSingleton::GetInstance();
-  return states->rdmaStates->commContext->IsSdmaEnabled();
+  return RequireInitializedRdmaContext("ShmemSdmaEnabled")->IsSdmaEnabled();
 }
 
 /* ---------------------------------------------------------------------------------------------- */

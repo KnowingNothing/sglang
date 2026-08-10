@@ -44,6 +44,56 @@
 namespace mori {
 namespace application {
 
+namespace {
+
+bool SelectInterfaceAddress(struct ifaddrs* ifaddr, const char* interface_name,
+                            bool allow_loopback, SocketAddress& address,
+                            std::string* address_string = nullptr) {
+  // Preserve the existing preference for IPv4, but fall back to a global IPv6
+  // address when an interface (such as the MI308X control NIC) is IPv6-only.
+  // Link-local IPv6 is not usable here because UniqueId does not carry a scope
+  // id and peers may be on different hosts.
+  for (int family : {AF_INET, AF_INET6}) {
+    for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+      if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != family) continue;
+      if (interface_name != nullptr && std::string(ifa->ifa_name) != interface_name) continue;
+      if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
+
+      char text[INET6_ADDRSTRLEN]{};
+      memset(&address, 0, sizeof(address));
+
+      if (family == AF_INET) {
+        auto* addr4 = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        if (!allow_loopback && ntohl(addr4->sin_addr.s_addr) == INADDR_LOOPBACK) continue;
+        memcpy(&address.sin, addr4, sizeof(*addr4));
+        address.sin.sin_port = 0;
+        if (address_string != nullptr &&
+            inet_ntop(AF_INET, &addr4->sin_addr, text, sizeof(text)) != nullptr) {
+          *address_string = text;
+        }
+        return true;
+      }
+
+      auto* addr6 = reinterpret_cast<struct sockaddr_in6*>(ifa->ifa_addr);
+      if ((!allow_loopback && IN6_IS_ADDR_LOOPBACK(&addr6->sin6_addr)) ||
+          IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr)) {
+        continue;
+      }
+      memcpy(&address.sin6, addr6, sizeof(*addr6));
+      address.sin6.sin6_port = 0;
+      if (address_string != nullptr &&
+          inet_ntop(AF_INET6, &addr6->sin6_addr, text, sizeof(text)) != nullptr) {
+        *address_string = "[" + std::string(text) + "]";
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+}  // namespace
+
 SocketBootstrapNetwork::SocketBootstrapNetwork(const UniqueId& unique_id, int rank, int world_size)
     : unique_id_(unique_id), initialized_(false), unexpected_connections_(nullptr) {
   localRank = rank;
@@ -63,6 +113,12 @@ void SocketBootstrapNetwork::Initialize() {
         "Try setting MORI_SOCKET_IFNAME=<interface> (e.g. eth0, eno1) "
         "to specify the network interface for bootstrap communication.");
   }
+
+  const char* requested_ifname = std::getenv("MORI_SOCKET_IFNAME");
+  MORI_APP_INFO("Rank {} bootstrap socket requested_interface={} resolved_address={} family={}",
+                localRank, requested_ifname != nullptr ? requested_ifname : "<auto>",
+                AddressToString(local_interface_),
+                local_interface_.sa.sa_family == AF_INET6 ? "IPv6" : "IPv4");
 
   // Setup communication infrastructure
   if (!SetupCommunicationRing()) {
@@ -163,39 +219,15 @@ UniqueId SocketBootstrapNetwork::GenerateUniqueIdWithLocalAddr(int port) {
 
 UniqueId SocketBootstrapNetwork::GenerateUniqueIdWithInterface(const std::string& interface_name,
                                                                int port) {
-  struct ifaddrs *ifaddr, *ifa;
-  bool found = false;
+  struct ifaddrs* ifaddr;
+  SocketAddress address{};
   std::string addr_str;
 
   if (getifaddrs(&ifaddr) == -1) {
     throw std::runtime_error("Failed to get network interfaces");
   }
 
-  // Look for the specified interface
-  for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-    if (ifa->ifa_addr == nullptr) continue;
-    if (std::string(ifa->ifa_name) != interface_name) continue;
-
-    if (ifa->ifa_addr->sa_family == AF_INET) {
-      struct sockaddr_in* addr_in = (struct sockaddr_in*)ifa->ifa_addr;
-      char ip_str[INET_ADDRSTRLEN];
-
-      if (inet_ntop(AF_INET, &addr_in->sin_addr, ip_str, INET_ADDRSTRLEN)) {
-        addr_str = std::string(ip_str);
-        found = true;
-        break;
-      }
-    } else if (ifa->ifa_addr->sa_family == AF_INET6) {
-      struct sockaddr_in6* addr_in6 = (struct sockaddr_in6*)ifa->ifa_addr;
-      char ip_str[INET6_ADDRSTRLEN];
-
-      if (inet_ntop(AF_INET6, &addr_in6->sin6_addr, ip_str, INET6_ADDRSTRLEN)) {
-        addr_str = "[" + std::string(ip_str) + "]";
-        found = true;
-        break;
-      }
-    }
-  }
+  bool found = SelectInterfaceAddress(ifaddr, interface_name.c_str(), true, address, &addr_str);
 
   freeifaddrs(ifaddr);
 
@@ -257,61 +289,22 @@ std::vector<std::string> SocketBootstrapNetwork::GetAvailableNetworkInterfaces()
 }
 
 std::string SocketBootstrapNetwork::GetLocalNonLoopbackAddress() {
-  struct ifaddrs *ifaddr, *ifa;
+  struct ifaddrs* ifaddr;
+  SocketAddress address{};
   std::string result;
 
   if (getifaddrs(&ifaddr) == -1) {
     return result;
   }
 
-  // Priority order: prefer non-loopback IPv4 addresses first
-  for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-    if (ifa->ifa_addr == nullptr) continue;
-    if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
-
-    if (ifa->ifa_addr->sa_family == AF_INET) {
-      struct sockaddr_in* addr_in = (struct sockaddr_in*)ifa->ifa_addr;
-
-      // Skip loopback interface
-      if (ntohl(addr_in->sin_addr.s_addr) == INADDR_LOOPBACK) continue;
-
-      char ip_str[INET_ADDRSTRLEN];
-      if (inet_ntop(AF_INET, &addr_in->sin_addr, ip_str, INET_ADDRSTRLEN)) {
-        result = std::string(ip_str);
-        break;  // Prefer IPv4, so break immediately
-      }
-    }
-  }
-
-  // If no IPv4 found, try IPv6 (excluding loopback)
-  if (result.empty()) {
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-      if (ifa->ifa_addr == nullptr) continue;
-      if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
-
-      if (ifa->ifa_addr->sa_family == AF_INET6) {
-        struct sockaddr_in6* addr_in6 = (struct sockaddr_in6*)ifa->ifa_addr;
-
-        // Skip loopback (::1) and link-local addresses
-        if (IN6_IS_ADDR_LOOPBACK(&addr_in6->sin6_addr) ||
-            IN6_IS_ADDR_LINKLOCAL(&addr_in6->sin6_addr))
-          continue;
-
-        char ip_str[INET6_ADDRSTRLEN];
-        if (inet_ntop(AF_INET6, &addr_in6->sin6_addr, ip_str, INET6_ADDRSTRLEN)) {
-          result = std::string(ip_str);
-          break;
-        }
-      }
-    }
-  }
+  SelectInterfaceAddress(ifaddr, nullptr, false, address, &result);
 
   freeifaddrs(ifaddr);
   return result;
 }
 
 bool SocketBootstrapNetwork::FindNetworkInterface(SocketAddress& interface_addr) {
-  struct ifaddrs *ifaddr, *ifa;
+  struct ifaddrs* ifaddr;
   bool found = false;
 
   if (getifaddrs(&ifaddr) == -1) {
@@ -322,21 +315,7 @@ bool SocketBootstrapNetwork::FindNetworkInterface(SocketAddress& interface_addr)
   const char* ifname = std::getenv("MORI_SOCKET_IFNAME");
 
   if (ifname) {
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-      if (ifa->ifa_addr == nullptr) continue;
-      if (std::string(ifa->ifa_name) != ifname) continue;
-
-      if (ifa->ifa_addr->sa_family == AF_INET) {
-        struct sockaddr_in* addr_in = (struct sockaddr_in*)ifa->ifa_addr;
-
-        if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
-
-        memcpy(&interface_addr.sin, addr_in, sizeof(struct sockaddr_in));
-        interface_addr.sin.sin_port = 0;
-        found = true;
-        break;
-      }
-    }
+    found = SelectInterfaceAddress(ifaddr, ifname, true, interface_addr);
   }
 
   if (ifname && !found) {
@@ -347,24 +326,7 @@ bool SocketBootstrapNetwork::FindNetworkInterface(SocketAddress& interface_addr)
   }
 
   if (!found) {
-    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-      if (ifa->ifa_addr == nullptr) continue;
-
-      if (ifa->ifa_addr->sa_family == AF_INET) {
-        struct sockaddr_in* addr_in = (struct sockaddr_in*)ifa->ifa_addr;
-
-        // Skip loopback interface
-        if (ntohl(addr_in->sin_addr.s_addr) == INADDR_LOOPBACK) continue;
-
-        // Skip interfaces that are down
-        if (!(ifa->ifa_flags & IFF_UP) || !(ifa->ifa_flags & IFF_RUNNING)) continue;
-
-        memcpy(&interface_addr.sin, addr_in, sizeof(struct sockaddr_in));
-        interface_addr.sin.sin_port = 0;  // Let system choose port
-        found = true;
-        break;
-      }
-    }
+    found = SelectInterfaceAddress(ifaddr, nullptr, false, interface_addr);
   }
 
   freeifaddrs(ifaddr);
@@ -459,10 +421,9 @@ void SocketBootstrapNetwork::ExtractAddressFromUniqueId(const UniqueId& uid, Soc
 bool SocketBootstrapNetwork::InitializeSocket(Socket& sock, const SocketAddress* addr) {
   CloseSocket(sock);
 
-  int family = AF_INET;
-  if (addr && addr->sa.sa_family == AF_INET6) {
-    family = AF_INET6;
-  }
+  const SocketAddress* selected_addr = addr != nullptr ? addr : &local_interface_;
+  const int family = selected_addr->sa.sa_family;
+  if (family != AF_INET && family != AF_INET6) return false;
 
   sock.fd = socket(family, SOCK_STREAM, 0);
   if (sock.fd == -1) {
@@ -473,11 +434,7 @@ bool SocketBootstrapNetwork::InitializeSocket(Socket& sock, const SocketAddress*
   int opt = 1;
   setsockopt(sock.fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-  if (addr) {
-    memcpy(&sock.addr, addr, sizeof(SocketAddress));
-  } else {
-    memcpy(&sock.addr, &local_interface_, sizeof(SocketAddress));
-  }
+  memcpy(&sock.addr, selected_addr, sizeof(SocketAddress));
 
   sock.state = SocketStateInitialized;
 
