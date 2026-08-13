@@ -10,7 +10,8 @@ def test_xgrammar_uses_triton_bitmask_on_rocm():
     bitmask = torch.full((4, 2), -1, dtype=torch.int32, device="cuda")
     bitmask[:, 0] = 0
 
-    xgrammar_backend.XGrammarGrammar.apply_vocab_mask(logits, bitmask)
+    grammar = object.__new__(xgrammar_backend.XGrammarGrammar)
+    grammar.apply_vocab_mask(logits, bitmask)
     torch.cuda.synchronize()
     assert torch.isneginf(logits[:, :32]).all()
     assert torch.isfinite(logits[:, 32:]).all()
