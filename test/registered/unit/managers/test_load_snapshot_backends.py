@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.managers.load_snapshot import (
     LoadSnapshot,
@@ -12,9 +13,11 @@ from sglang.srt.managers.load_snapshot import (
     ShmLoadSnapshotWriter,
     ZmqLoadSnapshotWriter,
     ZmqShmLoadSnapshotReader,
+    ZMQ_DRAIN_MAX_MESSAGES,
     _zmq_addr_for,
     create_load_snapshot_reader,
     create_load_snapshot_writer,
+    snapshot_encoder,
     should_use_zmq,
     zmq_reader_owner,
 )
@@ -129,6 +132,28 @@ class TestShmRoundTrip(CustomTestCase):
 
 
 class TestZmqRoundTrip(CustomTestCase):
+    def test_poll_is_bounded_when_socket_never_becomes_empty(self):
+        reader = object.__new__(ZmqShmLoadSnapshotReader)
+        reader._zmq = SimpleNamespace(NOBLOCK=1, Again=RuntimeError)
+        reader._socket = Mock()
+        reader._socket.recv.side_effect = [
+            snapshot_encoder.encode(
+                LoadSnapshot(dp_rank=0, timestamp=float(i), num_running_reqs=i)
+            )
+            for i in range(ZMQ_DRAIN_MAX_MESSAGES + 1)
+        ]
+        shm_writer = Mock()
+        reader._shm_writers = {0: shm_writer}
+        reader._shm_path = "/unused"
+        reader.dp_size = 1
+
+        reader._poll()
+
+        self.assertEqual(reader._socket.recv.call_count, ZMQ_DRAIN_MAX_MESSAGES)
+        self.assertEqual(shm_writer.write.call_count, 1)
+        written = shm_writer.write.call_args.args[0]
+        self.assertEqual(written.timestamp, float(ZMQ_DRAIN_MAX_MESSAGES - 1))
+
     def test_single_rank_zmq_to_shm(self):
         shm_path = _temp_path()
         addr = _ipc_addr()

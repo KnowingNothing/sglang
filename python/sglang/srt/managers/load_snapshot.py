@@ -271,6 +271,11 @@ VERSION = 2
 HEADER_STRUCT = struct.Struct("<4sHHI")
 SLOT_LEN_STRUCT = struct.Struct("<I")
 SLOT_SIZE = 16 * 1024
+# Keep request dispatch and control fan-out responsive even when every remote
+# scheduler publishes load snapshots continuously.  A drain-until-EAGAIN loop
+# can otherwise starve forever because the PULL socket is refilled faster than
+# the controller consumes it.
+ZMQ_DRAIN_MAX_MESSAGES = 1024
 
 
 @contextmanager
@@ -540,9 +545,18 @@ class ZmqShmLoadSnapshotReader:
         self._shm_writers: dict[int, ShmLoadSnapshotWriter] = {}
 
     def _poll(self) -> None:
-        """Drain zmq messages and write latest per dp_rank to SHM."""
+        """Drain a bounded ZMQ batch and write the latest snapshot per rank.
+
+        The PULL socket can receive a continuous stream from busy multi-node DP
+        workers.  Returning only after ``EAGAIN`` is unsafe in that case: a
+        load-aware data-parallel controller calls this method on the request
+        dispatch path, so an unbounded drain can permanently starve inference
+        and control messages.  Bound the work per call; later polls consume the
+        remaining snapshots, while the writers' ``CONFLATE`` setting keeps the
+        backlog focused on current state.
+        """
         latest: dict[int, LoadSnapshot] = {}
-        while True:
+        for _ in range(ZMQ_DRAIN_MAX_MESSAGES):
             try:
                 data = self._socket.recv(self._zmq.NOBLOCK)
             except self._zmq.Again:
