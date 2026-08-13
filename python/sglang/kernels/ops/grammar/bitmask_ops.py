@@ -126,6 +126,16 @@ def apply_token_bitmask_inplace_triton(
         grid = (num_rows * num_blocks,)
         NUM_SMS = triton.next_power_of_2(grid[0])
 
+    # A 4096-token block maps to 2048 fp32 elements per vectorized warp by the
+    # CUDA-oriented heuristic below.  On ROCm that becomes 32 wavefronts, or
+    # 2048 threads, which exceeds gfx942's 1024-thread workgroup limit.  Cap
+    # the launch at the hardware maximum; every program still iterates over
+    # the complete BLOCK_SIZE, so this changes only execution geometry.
+    num_warps = min(
+        BLOCK_SIZE // 32 // (16 // logits.element_size()),
+        1024 // torch.cuda.get_device_properties(logits.device).warp_size,
+    )
+
     apply_token_bitmask_inplace_kernel[grid](
         logits,
         bitmask,
@@ -136,6 +146,6 @@ def apply_token_bitmask_inplace_triton(
         bitmask_shape[1],
         NUM_SMS,
         BLOCK_SIZE,
-        num_warps=BLOCK_SIZE // 32 // (16 // logits.element_size()),
+        num_warps=num_warps,
         num_stages=3,
     )

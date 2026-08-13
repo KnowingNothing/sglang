@@ -37,16 +37,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
-
-if _is_hip:
-    from sgl_kernel import apply_token_bitmask_inplace_cuda
-else:
-    from sglang.kernels.ops.grammar.bitmask_ops import (
-        apply_token_bitmask_inplace_triton,
-    )
+from sglang.kernels.ops.grammar.bitmask_ops import (
+    apply_token_bitmask_inplace_triton,
+)
 
 from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
@@ -124,10 +117,10 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type in {"cuda", "xpu", "musa"}:
-            if _is_hip:
-                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-            else:
-                apply_token_bitmask_inplace_triton(logits, vocab_mask)
+            # Use the portable Triton implementation on all GPU backends.  It
+            # shares xgrammar's packed-bit semantics and avoids backend-specific
+            # native-kernel failures for multi-row constrained-decoding batches.
+            apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
             import sgl_kernel_npu  # noqa: F401
 
@@ -250,10 +243,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
-            if _is_hip:
-                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
-            else:
-                apply_token_bitmask_inplace_triton(logits, vocab_mask)
+            apply_token_bitmask_inplace_triton(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
