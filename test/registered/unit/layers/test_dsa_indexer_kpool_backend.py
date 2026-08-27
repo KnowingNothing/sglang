@@ -97,6 +97,26 @@ class TestKPoolMqaBackend(CustomTestCase):
             torch.tensor([[2, 3, 4, 5]], dtype=torch.int32),
         )
 
+    def test_portable_topk_gathers_only_selected_page_table_rows(self):
+        logits = torch.tensor(
+            [[0.1, 0.9, 0.8, 50.0], [0.7, 0.2, 0.6, 50.0]],
+            dtype=torch.float32,
+        )
+        page_table = torch.arange(3 * 8, dtype=torch.int32).reshape(3, 8)
+        result = _topk_from_pooled_history_logits_unfused(
+            logits=logits,
+            group_lengths=torch.tensor([3, 3], dtype=torch.int32),
+            pool_size=2,
+            topk=4,
+            page_table=page_table,
+            page_table_row_index=torch.tensor([2, 0], dtype=torch.int32),
+        )
+
+        torch.testing.assert_close(
+            result,
+            torch.tensor([[18, 19, 20, 21], [0, 1, 4, 5]], dtype=torch.int32),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

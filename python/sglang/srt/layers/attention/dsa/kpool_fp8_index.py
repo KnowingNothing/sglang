@@ -428,6 +428,7 @@ def expand_pooled_groups_to_topk(
     pool_size: int,
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Expand selected full-pool ids to a strict-width token topk tensor."""
     assert group_ids.ndim == 2
@@ -435,6 +436,7 @@ def expand_pooled_groups_to_topk(
     assert topk % pool_size == 0
     assert group_ids.shape[1] == history_group_budget_for_topk(topk, pool_size)
     assert page_table is None or topk_offsets is None
+    assert page_table_row_index is None or page_table is not None
 
     device = group_ids.device
     offsets = torch.arange(pool_size, device=device, dtype=torch.int64)
@@ -448,9 +450,20 @@ def expand_pooled_groups_to_topk(
 
     if page_table is not None:
         assert page_table.ndim == 2
-        assert page_table.shape[0] == group_ids.shape[0]
         safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1)
-        output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
+        if page_table_row_index is None:
+            assert page_table.shape[0] == group_ids.shape[0]
+            output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
+        else:
+            assert page_table_row_index.ndim == 1
+            assert page_table_row_index.shape[0] == group_ids.shape[0]
+            row_ids = page_table_row_index.to(
+                dtype=torch.int64, device=page_table.device
+            ).unsqueeze(1)
+            # Gather only the selected token slots. Do not first index_select the
+            # full context-width rows: at 1M context, expanded speculative rows can
+            # otherwise materialize tens of GiB before top-k has reduced the data.
+            output = page_table[row_ids, safe_ids].to(torch.int32)
     elif topk_offsets is not None:
         if topk_offsets.ndim == 2:
             assert topk_offsets.shape[1] == 1
@@ -470,6 +483,7 @@ def append_kpool_tail_to_topk(
     pool_size: int,
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Append non-pooled tail tokens after selected expanded-history tokens."""
     assert topk_result.dtype == torch.int32
@@ -477,6 +491,7 @@ def append_kpool_tail_to_topk(
     assert pool_lens.ndim == 1
     assert seq_lens.shape[0] == topk_result.shape[0]
     assert pool_lens.shape[0] == topk_result.shape[0]
+    assert page_table_row_index is None or page_table is not None
 
     tail_pool = pool_size - 1
     if tail_pool == 0:
@@ -507,6 +522,17 @@ def append_kpool_tail_to_topk(
         assert topk_offsets.ndim == 1
         has_topk_offsets = True
 
+    if page_table_row_index is None:
+        page_table_row_index = seq_lens
+        has_page_table_row_index = False
+    else:
+        assert page_table_row_index.ndim == 1
+        assert page_table_row_index.shape[0] == rows
+        page_table_row_index = page_table_row_index.to(
+            dtype=torch.int64, device=topk_result.device
+        ).contiguous()
+        has_page_table_row_index = True
+
     block_cols = triton.next_power_of_2(out_cols)
     _append_kpool_tail_to_topk_kernel[(rows,)](
         topk_result,
@@ -514,6 +540,7 @@ def append_kpool_tail_to_topk(
         pool_lens,
         page_table,
         topk_offsets,
+        page_table_row_index,
         out,
         topk_result.stride(0),
         topk_result.stride(1),
@@ -527,6 +554,7 @@ def append_kpool_tail_to_topk(
         POOL_SIZE=pool_size,
         HAS_PAGE_TABLE=has_page_table,
         HAS_TOPK_OFFSETS=has_topk_offsets,
+        HAS_PAGE_TABLE_ROW_INDEX=has_page_table_row_index,
         BLOCK_COLS=block_cols,
     )
     return out
@@ -539,6 +567,7 @@ def _append_kpool_tail_to_topk_kernel(
     pool_lens_ptr,
     page_table_ptr,
     topk_offsets_ptr,
+    page_table_row_index_ptr,
     out_ptr,
     topk_stride_0,
     topk_stride_1,
@@ -552,6 +581,7 @@ def _append_kpool_tail_to_topk_kernel(
     POOL_SIZE: tl.constexpr,
     HAS_PAGE_TABLE: tl.constexpr,
     HAS_TOPK_OFFSETS: tl.constexpr,
+    HAS_PAGE_TABLE_ROW_INDEX: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -578,12 +608,15 @@ def _append_kpool_tail_to_topk_kernel(
     tail_value = tail_raw
     if HAS_PAGE_TABLE:
         safe_tail = tl.minimum(tl.maximum(tail_raw, 0), PAGE_TABLE_COLS - 1)
+        page_table_row = row
+        if HAS_PAGE_TABLE_ROW_INDEX:
+            page_table_row = tl.load(page_table_row_index_ptr + row).to(tl.int64)
         # int64 row term: the wide page table's row stride is context-scale
         # (~2^20 on 1M-context models), so row * stride wraps int32 from
         # row ~2048 — same promotion as the fused metadata kernels.
         tail_value = tl.load(
             page_table_ptr
-            + row.to(tl.int64) * page_table_stride_0
+            + page_table_row.to(tl.int64) * page_table_stride_0
             + safe_tail * page_table_stride_1,
             mask=mask & is_tail,
             other=-1,
@@ -674,10 +707,6 @@ def topk_from_pooled_history_logits(
         padded[: result.shape[0]] = result
         return padded
 
-    assert (
-        page_table_row_index is None
-    ), "page_table_row_index requires the fused fast_kpool group_topk path"
-
     from sgl_kernel import fast_topk_v2
 
     selected_groups = fast_topk_v2(
@@ -701,6 +730,7 @@ def topk_from_pooled_history_logits(
         pool_size=pool_size,
         page_table=page_table,
         topk_offsets=topk_offsets,
+        page_table_row_index=page_table_row_index,
     )
     if seq_lens is None:
         result = expanded
@@ -712,6 +742,7 @@ def topk_from_pooled_history_logits(
             pool_size=pool_size,
             page_table=page_table,
             topk_offsets=topk_offsets,
+            page_table_row_index=page_table_row_index,
         )
     if out_rows is None or out_rows == result.shape[0]:
         return result
@@ -747,20 +778,14 @@ def _topk_from_pooled_history_logits_unfused(
     )
     group_valid = selected_groups >= 0
 
-    page_table_for_rows = page_table
-    if page_table_row_index is not None:
-        assert page_table is not None
-        page_table_for_rows = page_table.index_select(
-            0, page_table_row_index.to(dtype=torch.int64, device=page_table.device)
-        )
-
     expanded = expand_pooled_groups_to_topk(
         selected_groups.contiguous(),
         group_valid,
         topk=topk,
         pool_size=pool_size,
-        page_table=page_table_for_rows,
+        page_table=page_table,
         topk_offsets=topk_offsets,
+        page_table_row_index=page_table_row_index,
     )
     if seq_lens is None:
         result = expanded
@@ -770,8 +795,9 @@ def _topk_from_pooled_history_logits_unfused(
             seq_lens=seq_lens,
             pool_lens=group_lengths,
             pool_size=pool_size,
-            page_table=page_table_for_rows,
+            page_table=page_table,
             topk_offsets=topk_offsets,
+            page_table_row_index=page_table_row_index,
         )
     if out_rows is None or out_rows == result.shape[0]:
         return result
