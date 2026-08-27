@@ -219,6 +219,11 @@ def _is_kpool_metadata_fusion_supported(
     )
 
 
+def _dsa_sparse_topk_capacity(index_topk: int, index_kpool: int) -> int:
+    """Maximum sparse-index width after KPool appends the live tail."""
+    return index_topk + max(index_kpool - 1, 0)
+
+
 def _get_plan_topk_v2():
     """Lazy, cached resolver for the JIT top-k v2 plan refresher.
 
@@ -467,6 +472,9 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
+        self.dsa_sparse_topk_capacity = _dsa_sparse_topk_capacity(
+            self.dsa_index_topk, self.dsa_index_kpool
+        )
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         # The fused metadata kernels are already the standard path for
         # kpool<=1 backends; this flag extends them to page-aligned KPool
@@ -574,7 +582,7 @@ class DeepseekSparseAttnBackend(
             )
 
             self.kv_indices = torch.zeros(
-                max_bs * self.dsa_index_topk,
+                max_bs * self.dsa_sparse_topk_capacity,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -821,6 +829,7 @@ class DeepseekSparseAttnBackend(
         max_seqlen_q: int,
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
+        sparse_topk: int,
     ) -> dict:
         self._ensure_aiter_dsa_decode_metadata_buffer(
             max_seqlen_q=max_seqlen_q,
@@ -849,7 +858,7 @@ class DeepseekSparseAttnBackend(
             max_seqlen_qo=max_seqlen_q,
             uni_seqlen_qo=max_seqlen_q,
             fast_mode=False,
-            topk=self.dsa_index_topk,
+            topk=sparse_topk,
             max_split_per_batch=self.aiter_dsa_max_split_per_batch,
             intra_batch_mode=True,
             dtype_q=q_dtype,
@@ -877,12 +886,12 @@ class DeepseekSparseAttnBackend(
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("aiter", "fa3", "tilelang", "trtllm")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            f"currently only supported by the AITER/FA3/TileLang/TRTLLM DSA {phase} "
             "backend."
         )
 
@@ -4220,6 +4229,7 @@ class DeepseekSparseAttnBackend(
                 metadata.max_seq_len_q,
                 q_kernel.dtype,
                 kv_cache.dtype,
+                page_table_1.shape[1],
             )
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
@@ -4308,6 +4318,7 @@ class DeepseekSparseAttnBackend(
                 1,
                 q_kernel.dtype,
                 kv_cache.dtype,
+                page_table_1.shape[1],
             )
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
