@@ -30,7 +30,7 @@ def test_mhc_scatter_hidden_states_uses_variable_length_reduce_scatter():
         ),
         patch(
             "sglang.srt.layers.communicator_mhc.get_local_dp_buffer_mhc",
-            return_value=(local_hidden, global_hidden),
+            return_value=local_hidden,
         ),
         patch(
             "sglang.srt.layers.communicator_mhc.get_dp_global_num_tokens",
