@@ -101,6 +101,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
+    should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -863,6 +864,30 @@ class DeepseekV2MoE(nn.Module):
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
 
+    def _add_tp1_shared_expert_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add a replicated shared expert exactly once across deferred TP sums.
+
+        ``SGLANG_SHARED_EXPERT_TP1`` computes a complete shared-expert output on
+        every rank. Usually it is added after the post-expert all-reduce, so no
+        scaling is required. DP-attention EP can instead defer that sum to the
+        layer communicator (all-reduce fusion or reduce-scatter). Adding the
+        replicated tensor before that collective would multiply it by the TP
+        group size. Pre-scale only for those deferred-reduction paths so the
+        eventual sum reconstructs one shared-expert contribution.
+        """
+        forward = get_forward()
+        if (
+            should_use_dp_reduce_scatterv()
+            or forward.mlp_reduce_scatter
+            or forward.fuse_mlp_allreduce
+        ):
+            shared_output = shared_output / self.tp_size
+        return final_hidden_states + shared_output
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -1058,7 +1083,9 @@ class DeepseekV2MoE(nn.Module):
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
-            final_hidden_states += shared_output
+            final_hidden_states = self._add_tp1_shared_expert_output(
+                final_hidden_states, shared_output
+            )
         return final_hidden_states
 
     def forward_normal(
@@ -1198,7 +1225,9 @@ class DeepseekV2MoE(nn.Module):
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
-            final_hidden_states += shared_output
+            final_hidden_states = self._add_tp1_shared_expert_output(
+                final_hidden_states, shared_output
+            )
         return final_hidden_states
 
     def forward_cpu(
